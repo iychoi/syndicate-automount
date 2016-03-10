@@ -374,17 +374,28 @@ class AMDState(object):
             cur_volume_gateways = cur_volume_table.get( new_volume, None )
             if cur_volume_gateways is None:
                 # completely new volume 
+                assert 'gateways' in new_volume_info[new_volume].keys()
+                assert 'users' in new_volume_info[new_volume].keys()
+
+                for user_id in new_volume_info[new_volume]['users'].keys():
+                    log.debug("Completely new user: '%s'" % user_id)
+
+                for gateway_name in new_volume_info[new_volume]['gateways'].keys():
+                    if gateway_name != '__pkey__':
+                        log.debug("Completely new gateway: '%s'" % gateway_name)
+
                 new_volume_diff[new_volume] = new_volume_info[new_volume]
 
             else:
                 # volume is already present.
                 # find new gateway info
-                for gateway_name in new_volume_info.keys():
+                for gateway_name in new_volume_info['gateways'].keys():
                     if gateway_name == "__pkey__":
                         continue 
 
                     if gateway_name not in cur_volume_table[cur_volume]:
                         # new gateway 
+                        log.debug("New gateway in existing volume: '%s'" % gateway_name)
                         if volume_name in new_volume_info.keys():
                             new_volume_diff[volume_name][gateway_name] = new_volume_info[cur_volume][gateway_name]
 
@@ -397,15 +408,23 @@ class AMDState(object):
 
 
         for cur_volume in cur_volume_table.keys():
+                
+            assert 'gateways' in new_volume_info[new_volume].keys()
+            assert 'users' in new_volume_info[new_volume].keys()
+
             if cur_volume not in new_volume_info.keys():
                 # volume is dead 
+                for dead_gateway in cur_volume_table[cur_volume]['gateways']:
+                    log.debug("Dead volume, gateway '%s'" % dead_gateway)
+
                 old_gateways += cur_volume_table[cur_volume]
 
             else:
                 # volume is still here.
                 # find now-dead gateways 
                 for gateway_name in cur_volume_table[cur_volume]:
-                    if gateway_name not in new_volume_info[cur_volume]:
+                    if gateway_name not in new_volume_info[cur_volume]['gateways']:
+                        log.debug("Dead gateway '%s'" % gateway_name)
                         old_gateways.append( gateway_name )
 
 
@@ -602,7 +621,7 @@ def gateway_update_key( client, gateway_name, private_key_pem ):
     Set a gateway's keypair.
     """
     try:
-        rc = client.update_gateway( gateway_name, private_key=private_key_pem )
+        rc = rpcclient.ms_rpc( client, "update_gateway", gateway_name, private_key=private_key_pem )
         assert rc, "Update failed"
     except Exception, e:
         log.exception(e)
@@ -619,7 +638,7 @@ def gateway_ensure_key_updated( client, gateway_name, private_key_pem ):
     """
 
     need_update = False
-    gateway_pkey = storagelib.load_private_key( client.config, "gateway", gateway_name )
+    gateway_pkey = storage.load_private_key( client.config, "gateway", gateway_name )
     if gateway_pkey is None:
         # no key on file
         need_update = True 
@@ -629,7 +648,7 @@ def gateway_ensure_key_updated( client, gateway_name, private_key_pem ):
 
     if need_update:
         # re-generate and update 
-        pubkey_pem, privkey_pem = crypto.generate_key_pair( msconfig.OBJECT_KEY_SIZE )
+        pubkey_pem, privkey_pem = crypto.generate_key_pair( object_stub.OBJECT_KEY_SIZE )
         rc = gateway_update_key( client, gateway_name, privkey_pem )
         if not rc:
             log.error("Failed to update key for gateway '%s'" % gateway_name )
@@ -645,7 +664,7 @@ def user_info_install( config, user_cert, user_privkey_pem ):
     Given a user's automount server info, put it in place.
     """
     privkey = CryptoKey.importKey( user_privkey_pem )
-    storagelib.store_private_key( config, "user", user_cert.email, privkey, overwrite=True )
+    storage.store_private_key( config, "user", user_cert.email, privkey, overwrite=True )
     object_stub.store_user_cert( config, user_cert )
 
 
@@ -658,7 +677,7 @@ def user_info_remove( config, user_id ):
         log.error("No user cert on file for '%s'" % user_id)
         return 
 
-    storagelib.erase_private_key( config, "user", user_cert.email )
+    storage.erase_private_key( config, "user", user_cert.email )
     object_stub.remove_user_cert( config, user_cert.email )
 
 
@@ -667,7 +686,7 @@ def gateway_info_install( config, gateway_cert, gateway_privkey_pem ):
     Given a gateway's automount server info, put it in place.
     """
     privkey = CryptoKey.importKey( gateway_privkey_pem )
-    storagelib.store_private_key( config, "gateway", gateway_cert.name, privkey, overwrite=True )
+    storage.store_private_key( config, "gateway", gateway_cert.name, privkey, overwrite=True )
     object_stub.store_gateway_cert( config, gateway_cert )
 
 
@@ -675,7 +694,7 @@ def gateway_info_remove( config, gateway_name ):
     """
     Given a gateway's name, remove its cert and private key
     """
-    storagelib.erase_private_key( config, "gateway", gateway_name )
+    storage.erase_private_key( config, "gateway", gateway_name )
     object_stub.remove_gateway_cert( config, gateway_name )
 
 
@@ -705,7 +724,11 @@ def start_gateways( amd_state, volume_info ):
 
         # map gateway name to user name
         gateway_users = {}
-        for gateway_name, gateway_cert_str in gateway_infos.items():
+        for gateway_name, gateway_cert in gateway_infos.items():
+
+            if gateway_name == '__pkey__':
+                continue 
+
             for user_id_str, user_info in user_infos.items():
                 if gateway_cert.owner_id == int(user_id_str):
                     gateway_users[ gateway_cert.name ] = user_info['cert'].email
@@ -717,6 +740,9 @@ def start_gateways( amd_state, volume_info ):
             user_info_install( amd_state.config, user_info['cert'], user_info['pkey'] )
 
         for gateway_name, gateway_cert in gateway_infos.items():
+
+            if gateway_name == '__pkey__':
+                continue
 
             # install this gateway 
             gateway_info_install( amd_state.config, gateway_cert, gateway_initial_pkey )
