@@ -1,0 +1,36 @@
+{
+   "users": {
+      "create": [
+         {
+             "username": "testuser-001@rando.com"
+         }
+      ],
+      "delete": []
+   },
+   "volumes": {
+      "create": [
+         {
+            "name": "foo.testvolume-001",
+            "description": "description of testvolume-001",
+            "blocksize": 4096,
+            "owner": "testuser-001@rando.com",
+            "private": "true",
+            "archive": "false"
+         }
+      ],
+      "delete": []
+   },
+   "gateways": {
+      "create": [
+         {
+            "owner": "testuser-001@rando.com",
+            "volume": "foo.testvolume-001",
+            "type": "RG",
+            "host": "localhost",
+            "port": 31000
+         }
+      ],
+      "delete": []
+   }
+}
+

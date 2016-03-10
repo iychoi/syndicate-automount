@@ -1,0 +1,90 @@
+#!/usr/bin/python
+"""
+   Copyright 2016 The Trustees of Princeton University
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+"""
+
+import os
+import sys
+import argparse
+import subprocess
+import traceback
+
+# TODO: config file
+UG_PATH = "/usr/local/bin/syndicatefs"
+RG_PATH = "/usr/local/bin/syndicate-rg"
+AG_PATH = "/usr/local/bin/syndicate-ag"
+
+UG_TYPE = 1
+RG_TYPE = 2
+AG_TYPE = 3
+
+
+def gateway_start( path, opts ):
+    """
+    Start up a gateway.
+    Return a subprocess on success.
+    Return None on error.
+    """
+    
+    gateway_argv = [path, "-g", "%s" % opts.g, "-v", "%s" % opts.v, "-u", "%s" % opts.u]
+
+    try:
+        p = subprocess.Popen( gateway_argv, executable=path, close_fds=True, shell=False )
+        return p
+    except Exception, e:
+        print >> sys.stderr, "\n".join(traceback.format_exc())
+        return None
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        print >> sys.stderr, "Usage: %s syndicate_arg"
+        sys.exit(1)
+
+    # arg format: [-d] -g gateway_id -v volume_id -u user_id -t gateway_type
+    argv = sys.argv[0] + sys.argv[1].split(" ")
+    argp = argparse.ArgumentParser()
+    argp.add_argument("-d", help="log debugging output")
+    argp.add_argument("-g", required=True, help="the gateway's numeric ID")
+    argp.add_argument("-v", required=True, help="the volume's numeric ID")
+    argp.add_argument("-u", required=True, help="the user's numeric ID")
+    argp.add_argument("-t", required=True, help="the gateway's numeric type ID")
+
+    opts = argp.parse_known_args()
+    path = None
+
+    if opts.t == UG_TYPE:
+        path = UG_PATH
+    elif opts.t == RG_TYPE:
+        path = RG_PATH
+    elif opts.t == AG_TYPE:
+        path = AG_PATH
+    else:
+        print >> sys.stderr, "Unrecognized type %s" % opts.t
+        sys.exit(1)
+
+    p = gateway_start( path, opts )
+    if p is None:
+        print >> sys.stderr, "Failed to start %s" % path
+        sys.exit(1)
+
+    # success!
+    print "1"
+
+    # wait for exit... 
+    p.wait()
+
+    sys.exit(0)
+

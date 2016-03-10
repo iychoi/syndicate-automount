@@ -1,0 +1,59 @@
+#!/usr/bin/python
+"""
+   Copyright 2016 The Trustees of Princeton University
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+"""
+
+# helper to fetch the AMD server's public key 
+
+import os
+import sys
+import json 
+
+
+def fetch_public_key( instance_id, server_host, server_port ):
+    """
+    Fetch and validate the AMD server's public key
+    """
+    if os.path.exists("/tmp/test-poll-server-pubkey.pub"):
+        with open("/tmp/test-poll-server-pubkey.pub") as f:
+            dat = f.read()
+            return dat
+
+    return "Implement me"
+
+
+if __name__ == "__main__":
+    usage = "Usage: %s [instance ID] [server] [port]" % sys.argv[0]
+    if len(sys.argv) != 4:
+        print >> sys.stderr, usage
+        sys.exit(1)
+    
+    try: 
+        portnum = int(sys.argv[3])
+    except:
+        print >> sys.stderr, "Invalid port"
+        print >> sys.stderr, usage
+        sys.exit(1)
+
+    pubkey_pem = fetch_public_key( sys.argv[1], sys.argv[2], portnum )
+
+    json_out = {
+        "public_key": pubkey_pem
+    }
+
+    print json.dumps( json_out, indent=4, sort_keys=True )
+    sys.exit(0)
+
+

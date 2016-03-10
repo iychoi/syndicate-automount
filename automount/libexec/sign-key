@@ -1,0 +1,9 @@
+#!/bin/sh
+
+PORT="$1"
+shift 1
+
+# sign the key by sending it to our keysigner instance
+curl -d "$@" http://localhost:$PORT 2>/dev/null
+
+exit $?

@@ -1,0 +1,82 @@
+#!/usr/bin/python
+"""
+   Copyright 2016 The Trustees of Princeton University
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+"""
+
+# called by the automount server to get a list of automounted volumes.
+
+import os
+import sys
+import json
+
+import syndicate.util.certs as certs
+import syndicate.util.config as conf
+import syndicate.protobufs.ms_pb2 as ms_pb2
+
+log = conf.log
+
+def list_volumes( config, instance_id ):
+    """
+    Get the list of volumes that this automount server manages for a set of hosts
+    by searching through all the volumes in the ~/.syndicate/volumes directory.
+
+    Treat instance_id as a volume name prefix--if the volume name
+    starts with instance_id, then return it.
+    """
+
+    volume_cert_paths = certs.list_volume_cert_paths( config )
+    ret = []
+    for path in volume_cert_paths:
+
+        volume_cert = None
+        try:
+            volume_cert = ms_pb2.ms_volume_metadata()
+            with open(path, "r") as f:
+                volume_data = f.read()
+
+            volume_cert.ParseFromString( volume_data )
+        except Exception, e:
+            log.exception(e)
+            log.error("Failed to read '%s'" % path)
+            return None
+
+        if not volume_cert.name.startswith( instance_id + "." ):
+            continue
+
+        ret.append( volume_cert.name )
+
+    return ret
+
+
+if __name__ == "__main__":
+    
+    usage = "Usage: %s [-c config_path] instance_id" % sys.argv[0]
+    config = conf.get_config_from_argv( sys.argv )
+    if config is None:
+        print >> sys.stderr, usage
+        sys.exit(0)
+
+    if len(config['params']) != 1:
+        print >> sys.stderr, usage
+        sys.exit(1)
+
+    instance_id = config['params'][0]
+    volume_names = list_volumes( config, instance_id )
+    if volume_names is None:
+        sys.exit(1)
+
+    print json.dumps(volume_names)
+    sys.exit(0)
+

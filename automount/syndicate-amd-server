@@ -1,0 +1,1025 @@
+#!/usr/bin/python
+"""
+   Copyright 2016 The Trustees of Princeton University
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+"""
+
+# this daemon runs on the automount system's central server
+
+"""
+Automount request structure (signed by automount host):
+
+{
+    "hostname": <hostname>,
+    "instance": <instance ID string (e.g. slice name)>
+}
+
+Automount response structure (signed by automount server):
+{
+    "<volume name>": {
+        "__pkey__": encrypted pkey,
+        "<gateway name>": "gateway_cert_b64",
+        "<gateway name>": "gateway_cert_b64",
+        ...
+    },
+    ...
+}
+
+"""
+
+import os
+import sys
+import threading
+import tempfile
+import time
+import subprocess
+import json
+import base64
+import BaseHTTPServer
+
+from Crypto.PublicKey import RSA as CryptoKey
+
+import syndicate.util.paths as paths
+import syndicate.util.config as conf
+import syndicate.ms.msconfig as msconfig
+import syndicate.util.client as rpc
+import syndicate.util.certs as certs
+import syndicate.util.objects as object_stub
+import syndicate.util.storage as storage
+import syndicate.util.provisioning as provisioning
+import syndicate.util.crypto as crypto
+import syndicate.protobufs.ms_pb2 as ms_pb2
+import syndicate.syndicate as libsyndicate
+
+log = conf.log
+
+AMD_REQUEST_FIELDS = ['hostname', 'instance']
+AMD_REQUEST_MAX_LEN = 16384
+
+# 'amd-server' section of the config file
+AMD_SERVER_OPTIONS = {
+   "private_key":       ("-k", 1, "Path to the automount client's private key"),
+   "portnum":           ("-p", 1, "Port to listen on for push notifications from the automount server"),
+   "foreground":        ("-f", 0, "Run in the foreground")
+}
+
+
+def helper_run( helper_path, *args ):
+    """
+    Run a helper program, and gather its results.
+    Return its results as a JSON document.
+    Return None on error
+    """
+     
+    if not os.path.exists( helper_path ):
+        log.error("Not found: %s" % helper_path )
+        return None
+
+    helper = subprocess.Popen( [helper_path] + list(args), shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE )
+    helper_out, helper_err = helper.communicate()
+    helper.wait()
+
+    if len(helper_err.strip()) != 0:
+        log.error("helper errors: %s" % helper_err)
+
+    if helper.returncode != 0:
+        log.error("helper '%s' exited %s" % (helper_path,helper.returncode))
+        return None
+
+    try:
+        helper_json = json.loads(helper_out)
+    except Exception, e:
+        log.exception(e)
+        log.error("Failed to parse output of '%s'" % helper_path)
+        return None
+
+    return helper_json
+
+
+def list_hosts():
+    """
+    Get the list of hosts this automounter server
+    will communicate with.
+
+    Return an array of hosts on success.
+    Return None on error
+    """
+    all_hosts = helper_run( paths.list_hosts )
+    assert type(all_hosts) == list, "Invalid list-hosts return value"
+    return [str(h) for h in all_hosts]
+
+
+def list_volumes( config, instance_id ):
+    """
+    Get the list of volumes this automounter server
+    manages.
+
+    Return an array of volume names on success.
+    Return None on error.
+    """
+    all_volumes = helper_run( paths.list_volumes, "-c", config['config_path'], instance_id )
+    assert type(all_volumes) == list, "Invalid list-volumes return value"
+    return [str(v) for v in all_volumes]
+
+
+def poll_host( hostname ):
+    """
+    Get host information for a given host.
+    Return a JSON dict on success
+    Return None on error
+    """
+    return helper_run( paths.poll_host, hostname )
+
+
+def amd_parse_request( amd_client_public_key, signed_json_text, expected_hostname=None ):
+    """
+    Given a client automount daemon request, serialized
+    as JSON, try to parse it.
+
+    Request must be a JSON document in the format:
+    {
+        "hostname": <hostname>,
+        "instance": <instance_id>
+    }
+
+    It must also be signed by the host.
+    """
+
+    global AMD_REQUEST_FIELDS
+
+    rc, data_text = crypto.verify_and_parse_json( amd_client_public_key, signed_json_text )
+    if rc != 0:
+        log.error("Failed to verify JSON (%s)" % rc)
+        return None 
+
+    try:
+        data = json.loads(data_text)
+    except Exception, e:
+        log.exception(e)
+        log.error("JSON text cannot be parsed")
+        return None
+
+    if expected_hostname is not None:
+        unverified_data = json.loads(signed_json_text)
+        if 'hostname' not in unverified_data.keys():
+            log.error("JSON text is missing top-level 'hostname' field")
+            return None
+        
+        if expected_hostname != unverified_data['hostname']:
+            log.error("Hostname mismatch ('%s' != '%s')" % (hostname, json_text['hostname']))
+            return None 
+
+    missing = []
+    for key in AMD_REQUEST_FIELDS:
+        if key not in data.keys():
+            missing.append(key)
+
+    if len(missing) > 0:
+        log.error("Request is missing fields: %s" % (",".join(missing)))
+        return None
+    
+    return data
+    
+
+def list_volume_gateways_by_host( config, volume_id, hostname ):
+    """
+    Find all gateway certs in a volume with the given hostname.
+    Only applies to gateways generated by this amd server.
+    """
+    gateway_cert_paths = certs.list_gateway_cert_paths( config )
+    ret = []
+
+    for path in gateway_cert_paths:
+       
+        gateway_cert = None 
+
+        try:
+            with open(path, "r") as f:
+                cert_bin = f.read()
+
+            gateway_cert = ms_pb2.ms_gateway_cert()
+            gateway_cert.ParseFromString( cert_bin )
+
+        except:
+            log.error("Failed to load '%s'" % path)
+            return None
+
+        if gateway_cert.volume_id != volume_id:
+            continue
+
+        if gateway_cert.host != hostname:
+            continue
+
+        log.debug("%s on %s" % (gateway_cert.name, hostname))
+        ret.append( gateway_cert )
+
+    return ret
+
+
+def amd_get_info( config, request, host_info ):
+    """
+    Get the amd host-specific volume and gateway listing.
+    Return a dict with the structure:
+    {
+        "volume_name": {
+            "gateways": {
+                "__pkey__":  "encrypted pkey",
+                "gateway_name": "gateway_cert_b64",
+                "gateway_name": "gateway_cert_b64",
+                ...
+            },
+            "users": {
+                user_id: {
+                    "pkey": "encrypted pkey",
+                    "cert": "user_cert_b64"
+                }
+                ...
+            }
+        }
+        ...
+    }
+    where each volume named has only the gateway
+    certificates on this particular host.
+
+    Because we create one initial gateway private key
+    per volume, we only need to give that singular private
+    key back.  The automounter will change the public key
+    once it gets the private key.
+    """
+
+    hostname = request['hostname']
+    instance = request['instance']
+    privkey_pem = config['amd_server_privkey']
+
+    # find all volumes for the given instance 
+    volumes = list_volumes( config, instance )
+    if volumes is None:
+        log.error("Failed to list volumes for '%s'" % instance)
+        return {} 
+
+    # get the remote host's public key 
+    host_pubkey_pem = host_info['public_key']
+
+    ret = {}
+    for volume_name in volumes:
+
+        # get the volume ID 
+        volume_cert = object_stub.load_volume_cert( config, volume_name )
+        if volume_cert is None:
+            log.error("No such volume '%s'" % volume_name)
+            return {} 
+
+        volume_id = volume_cert.volume_id
+
+        # find all gateways in this volume, on this host
+        gateway_certs = list_volume_gateways_by_host( config, volume_id, hostname )
+        if gateway_certs is None:
+            log.error("Failed to load gateway certs for '%s'" % volume_name)
+            return {}
+
+        if len(gateway_certs) == 0:
+            # no relevant gateways 
+            continue 
+
+        # find all associated user certs and their private keys, and serialize them
+        user_certs = {}
+        for gateway_cert in gateway_certs:
+
+            # user cert
+            user_cert = object_stub.load_user_cert( config, gateway_cert.owner_id )
+            if user_cert is None:
+                log.error("No such user '%s'" % gateway_cert.owner_id )
+                return {}
+
+            log.debug("User '%s' owns gateway '%s'" % (user_cert.email, gateway_cert.name))
+
+            # user private key
+            user_pkey = storage.load_private_key( config, "user", user_cert.email )
+            if user_pkey is None:
+                log.error("No such user private key '%s'" % user_cert.email )
+                return {}
+
+            user_pkey_pem = user_pkey.exportKey()
+            rc, user_pkey_pem_enc = libsyndicate.encrypt_data( privkey_pem, host_pubkey_pem, user_pkey_pem )
+            if rc != 0:
+                log.error("Failed to encrypt key for '%s', rc = %s" % (user_cert.email, rc))
+                return {}
+
+            user_certs[ str(gateway_cert.owner_id) ] = {
+                "cert": base64.b64encode( user_cert.SerializeToString() ),
+                "pkey": base64.b64encode( user_pkey_pem_enc )
+            }
+
+        # serialize and b64-encode 
+        gateway_certs = {}
+        for gwc in gateway_certs:
+            gateway_certs[ gwc.name ] = base64.b64encode( gwc.SerializeToString() )
+
+        # encrypt the private key for this volume's gateways...
+        pkey_pem = get_gateway_initial_pkey( config, volume_name )
+        if pkey_pem is None:
+            log.debug("Volume '%s' is not under automount control" % volume_name )
+            continue
+
+        rc, pkey_pem_enc = libsyndicate.encrypt_data( privkey_pem, host_pubkey_pem, pkey_pem )
+        if rc != 0:
+            log.error("Failed to encrypt response; rc = %d\n", rc)
+            return {}
+
+        gateway_certs["__pkey__"] = base64.b64encode( pkey_pem_enc )
+
+        # done with this volume
+        ret[volume_name] = {
+            "gateways": gateway_certs,
+            "users": user_certs
+        }
+
+    return ret
+
+
+def amd_handle_request( config, private_key_pem, client_rfile, data_len=AMD_REQUEST_MAX_LEN-1 ):
+    """
+    Handle one request for automount data, from a given client host.
+
+    Return the automount info on success, as a dict
+    Return None on error
+    """
+    
+    data = client_rfile.read( data_len )
+
+    # json itself must have a top-level 'hostname' field 
+    unauthenticated_hostname = None
+    try:
+        unauthenticated_json = json.loads(data)
+        assert 'hostname' in unauthenticated_json.keys(), "Missing top-level hostname"
+        unauthenticated_hostname = unauthenticated_json['hostname']
+    except Exception, e:
+        log.exception(e)
+        log.error("Failed to parse JSON")
+        return None 
+   
+    # validate unauthenticated hostname
+    all_hosts = list_hosts()
+    if unauthenticated_hostname not in all_hosts:
+        # not a host we can look up
+        log.error("Unrecognized host '%s'" % unauthenticated_hostname)
+        return None
+
+    # validate info
+    host_info = poll_host( unauthenticated_hostname )
+    host_pubkey = host_info['public_key']
+    request_data = amd_parse_request( host_pubkey, data, expected_hostname=unauthenticated_hostname )
+    if request_data is None:
+        # nope!
+        log.error("Failed to parse request from '%s'" % unauthenticated_hostname)
+        return None 
+
+    log.debug("Parsed request:\n%s" % json.dumps(request_data, indent=4, sort_keys=True))
+
+    host_gateway_info = amd_get_info( config, request_data, host_info )
+
+    log.debug("Host info:\n%s" % json.dumps(host_gateway_info, indent=4, sort_keys=True))
+
+    host_gateway_info_txt = json.dumps( host_gateway_info )
+    private_key = CryptoKey.importKey( private_key_pem )
+    signed_info = crypto.sign_and_serialize_json( private_key, host_gateway_info_txt )
+
+    return signed_info
+
+
+class GatewayProxy( BaseHTTPServer.HTTPServer ):
+
+    def __init__( self, port, config, private_key_pem ):
+
+        BaseHTTPServer.HTTPServer.__init__( self, ("", port), GatewayProxyHandler )
+        self.config = config
+        self.private_key_pem = private_key_pem
+        
+
+class GatewayProxyHandler( BaseHTTPServer.BaseHTTPRequestHandler ):
+
+    def do_POST(self):
+        """
+        Given a request from a syndicate-amd instance:
+        * verify that it came from an authentic host.
+        * if requested to create a gateway, and the gateway does not exist but needs to exist, create it.
+        * if requested to delete a gateway, and the gateway exists but needs to not exist, delete it.
+        """
+
+        global AMD_REQUEST_MAX_LEN
+
+        config = self.server.config
+        private_key_pem = self.server.private_key_pem
+
+        data_len = self.headers.get('content-length', None)
+        if data_len is None:
+            self.send_response( 400 )
+            self.end_headers()
+            return 
+
+        try:
+            data_len = int(data_len)
+        except:
+            self.send_response( 400 )
+            self.end_headers()
+            return
+
+        signed_info = amd_handle_request( config, private_key_pem, self.rfile, data_len=data_len )
+        if signed_info is None:
+            self.send_response( 401 )
+            return 
+
+        self.send_response( 200 )
+        self.send_header( "content-type", "text/plain" )
+        self.send_header( "content-length", len(signed_info) )
+        self.end_headers()
+        self.wfile.write( signed_info )
+        return
+
+
+
+def provision_users_add( client, user_provision_plan ):
+    """
+    Add a set of users
+    user_provision_plan is a JSON document; see provision().
+
+    Return (True, []) on no errors
+    Return (False, [failed users]) on at least one error
+    """
+
+    rc = True
+    failed_users = []
+    if "create" in user_provision_plan.keys():
+
+        # make sure these users exist
+        for user_info in user_provision_plan["create"]:
+
+            log.debug("Ensure user created: '%s'" % user_info['username'] )
+
+            # if the user actually exists, then pass in the private key 
+            pubkey_pem = None
+            privkey_pem = None
+            user_pkey = storage.load_private_key( client.config, "user", user_info['username'] )
+            if user_pkey is not None:
+                privkey_pem = user_pkey.exportKey()
+                pubkey_pem = user_pkey.publickey().exportKey()
+            else:
+                log.debug("Generating new keypair for '%s'" % user_info['username'])
+                pubkey_pem, privkey_pem = crypto.generate_key_pair( msconfig.OBJECT_KEY_SIZE )
+
+            try:
+                created, updated, user = provisioning.ensure_user_exists( client, user_info['username'], privkey_pem )
+                assert created or updated or user is not None, "Failed to provision user"
+            except Exception, e:
+                log.exception(e)
+                log.error("Failed to create user '%s'" % user_info['username'] )
+                rc = False
+                failed_users.append(user_info['username'])
+                continue
+
+    return (rc, failed_users)
+
+
+def provision_users_remove( client, user_provision_plan ):
+    """
+    Remove a set of users.
+    user_provision_plan is a JSON document; see provision()
+
+    Return True on no errors
+    Return False on at least one error
+    """
+
+    rc = True
+    if "delete" in user_provision_plan.keys():
+
+        # make sure these users are dead 
+        for username in user_provision_plan["delete"]:
+
+            log.debug("Ensure user deleted: '%s'" % username )
+
+            try:
+                rc = provisioning.ensure_user_absent( client, username )
+                assert rc, "Failed to delete user"
+            except Exception, e:
+                log.exception(e)
+                log.error("Failed to delete user '%s'" % username )
+                rc = False
+                continue
+
+    return rc
+
+
+def str_to_bool( s ):
+    """
+    Convert "true" to True; "false" to False
+    """
+    if type(s) not in [str, unicode]:
+        raise ValueError("'%s' is not a string" % s)
+
+    if s.lower() == "false":
+        return False 
+
+    elif s.lower() == "true":
+        return True 
+
+    else:
+        raise ValueError("Indeterminate boolean '%s'" % s)
+
+
+def provision_volumes_add( client, volume_provision_plan, failed_users=[] ):
+    """
+    Add a set of volumes from a provision plan
+    volume_provision_plan is a JSON document; see provision()
+
+    Return True, [] on no errors
+    Return False, failed_volumes on at least one error
+    """
+
+    rc = True
+    failed_volumes = []
+    if "create" in volume_provision_plan.keys():
+
+        # make sure these volumes exist 
+        for volume_info in volume_provision_plan["create"]:
+
+            if volume_info['owner'] in failed_users:
+                log.warn("Will not provision volume '%s', since its owner's user account could not be created" % volume_info['name'])
+                failed_volumes.append( volume_info['name'] )
+                rc = False
+                continue 
+
+            else:
+                log.debug("Ensure volume created: '%s'" % volume_info['name'])
+
+            try:
+                volume_owner_client = rpc.make_rpc_client( client.config, volume_info["owner"] )
+            except Exception, e:
+                log.exception(e)
+                log.error("Failed to make an RPC client for '%s'" % volume_info['owner'])
+                failed_volumes.append(volume_info['name'])
+                rc = False
+                continue 
+
+            try:
+                private = str_to_bool( volume_info.get('private', 'true') )
+                archive = str_to_bool( volume_info.get('archive', 'false') )
+                volume_name = volume_info["name"]
+
+                created, updated, volume = provisioning.ensure_volume_exists( volume_owner_client, volume_name, volume_info["description"], volume_info["blocksize"], volume_info["owner"], 
+                                                                              private=private, archive=archive )
+
+                assert created or updated or volume is not None, "Failed to create volume"
+            except Exception, e:
+                log.exception(e)
+                log.error("Failed to provision volume '%s'" % volume_info['name'] )
+                rc = False
+                failed_volumes.append( volume_info['name'] )
+                continue
+
+    return rc, failed_volumes
+
+
+def provision_volumes_remove( client, volume_provision_plan ):
+    """
+    Remove a set of volumes in a provision plan
+    volume_provision_plan is a JSON document; see provision()
+
+    Return True on no errors
+    Return False on at least one error
+    """
+
+    rc = True
+    if "delete" in volume_provision_plan.keys():
+
+        # delete these volumes 
+        for volume_name in volume_provision_plan["delete"]:
+
+            log.debug("Ensure volume deleted: '%s'" % volume_name )
+
+            try:
+                rc = provisioning.ensure_volume_absent( client, volume_name )
+                assert rc, "Failed to delete volume"
+            except Exception, e:
+                log.exception(e)
+                log.error("Failed to delete volume '%s'" % volume_name )
+                rc = False
+                continue 
+
+    return rc
+
+
+
+def get_gateway_initial_pkey( config, volume_name ):
+    """
+    Get the initial private key for a volume's gateways
+    Return the pem-encoded private key on success
+    Return None on error
+    """
+
+    pkey_path = conf.object_file_path( config, "amd", volume_name + "-init.pkey" )
+    if not os.path.exists( pkey_path ):
+        return None
+
+    try:
+        pkey = storage.read_private_key( pkey_path )
+    except Exception, e:
+        log.exception(e)
+        log.error("Failed to load private key for '%s'" % pkey_path)
+        return None
+
+    return pkey.exportKey()
+
+
+def store_gateway_initial_pkey( config, volume_name, pkey_pem ):
+    """
+    Store the initial private key for a volume's gateways
+    Return True on success
+    Return False on error
+    """
+
+    pkey_path = conf.object_file_path( config, "amd", volume_name + "-init.pkey" )
+    if os.path.exists( pkey_path ):
+        log.warn("Overwriting '%s'" % pkey_path )
+
+    if not os.path.exists( os.path.dirname(pkey_path) ):
+        try:
+            os.makedirs(os.path.dirname(pkey_path))
+        except Exception, e:
+            log.exception(e)
+            log.error("Failed to create directory '%s'" % os.path.dirname(pkey_path))
+            return False
+
+    try:
+        rc = storage.write_key( pkey_path, pkey_pem, overwrite=True )
+        assert rc, "Failed to store '%s'" % pkey_path
+    except Exception, e:
+        log.exception(e)
+        log.error("Failed to store private key '%s'" % pkey_path )
+        return False
+
+    return True
+
+
+def provision_gateways_add( client, gateway_provision_plan, failed_users=[], failed_volumes=[] ):
+    """
+    Add a set of gateways.
+    Give each gateway the same private key (per volume); the
+    automount client will switch it once it has the gateway's info.
+
+    We would give each gateway its own private key, but this 
+    is very computationally expensive.
+
+    Return True, [] on no errors
+    Return False, failed_gateways on at least one error
+    """
+
+    rc = True
+    failed_gateways = []
+    if "create" in gateway_provision_plan.keys():
+    
+        gateway_pkeys = {}
+
+        # get or generate private keys for these gateways, grouped by volume
+        for gateway_info in gateway_provision_plan["create"]:
+
+            gateway_name = provisioning.make_gateway_name( gateway_info['type'], gateway_info['volume'], gateway_info['host'] )
+            volume_name = gateway_info['volume']
+
+            if volume_name in failed_volumes:
+                log.warn("Will not provision gateway '%s', because its volume could not be created" % gateway_name)
+                failed_gateways.append(gateway_name)
+                rc = False
+                continue
+
+            if gateway_info['owner'] in failed_users:
+                log.warn("Will not provision gateway '%s', because its owner's user account could not be created" % gateway_info['owner'] )
+                failed_gateways.append(gateway_name)
+                rc = False
+                continue
+
+            pkey_pem = get_gateway_initial_pkey( client.config, volume_name )
+            if pkey_pem is None:
+
+                log.info("Create initial private key for gateway '%s'" % gateway_name )
+
+                # generate one 
+                pubkey_pem, privkey_pem = crypto.generate_key_pair( msconfig.OBJECT_KEY_SIZE )
+                rc = store_gateway_initial_pkey( client.config, volume_name, privkey_pem )
+                if not rc:
+                    log.error("Failed to create initial gateway private key for '%s'" % gateway_name )
+                    rc = False
+                    continue 
+
+                pkey_pem = privkey_pem
+
+            gateway_pkeys[gateway_name] = pkey_pem
+
+
+        # make sure these gateways exist
+        for gateway_info in gateway_provision_plan["create"]:
+
+            gateway_name = provisioning.make_gateway_name( gateway_info['type'], gateway_info['volume'], gateway_info['host'] )
+            if gateway_name in failed_gateways:
+                continue 
+
+            log.info("Provision gateway '%s'" % gateway_name )
+
+            try:
+                port = int(gateway_info['port'])
+            except Exception, e:
+                log.exception(e)
+                log.error("Invalid port")
+                failed_gateways.append(gateway_name)
+                rc = False
+                continue
+
+            try:
+                gateway_owner_client = rpc.make_rpc_client( client.config, gateway_info["owner"] )
+            except Exception, e:
+                log.exception(e)
+                log.error("Failed to make an RPC client for '%s'" % volume_info['owner'])
+                failed_volumes.append(volume_info['name'])
+                rc = False
+                continue 
+
+            try:
+                created, updated, gateway = provisioning.ensure_gateway_exists( gateway_owner_client, gateway_info['type'], gateway_info['owner'], gateway_info['volume'],
+                                                                                gateway_name, gateway_info['host'], gateway_info['port'], private_key=gateway_pkeys[gateway_name],
+                                                                                caps=provisioning.gateway_default_caps( gateway_info['type'] ) )
+
+                assert created or updated or gateway is not None, "Failed to create gateway"
+            except Exception, e:
+                log.exception(e)
+                log.error("Failed to provision gateway '%s'" % gateway_name )
+                rc = False
+                failed_gateways.append(gateway_name)
+                continue
+
+    return rc, failed_gateways
+
+
+def provision_gateways_remove( client, gateway_provision_plan ):
+    """
+    Remove a set of gateways, given a gateway provision plan.
+
+    Return True on no errors
+    Return False on at least one error
+    """
+
+    rc = True
+    if "delete" in gateway_provision_plan.keys():
+
+        # delete gateways 
+        for gateway_info in gateway_provision_plan["delete"]:
+
+            gateway_name = provisioning.make_gateway_name( gateway_info['type'], gateway_info['volume'], gateway_info['host'] )
+            log.info("Delete gateway '%s'" % gateway_name )
+
+            try:
+                rc = provisioning.ensure_gateway_absent( client, gateway_name )
+                assert rc, "Failed to delete gateway '%s'" % gateway_name
+
+            except Exception, e:
+                log.exception(e)
+                log.error("Failed to delete gateway '%s'" % gateway_name)
+                rc = False
+                continue
+
+    return rc
+
+
+def provision( config, provision_plan ):
+    """
+    Do the necessary provisioning:
+    * get the list of users to create/delete from stdin
+    * get the list of volumes to create/delete from stdin
+    * get the list of gateways to create/delete from stdin
+    * carry out the above provisioning steps
+
+    Return True if there were no errors.
+    Return False if there was at least one error, in which case,
+    this method should be called again.
+
+    @provision_plan is a JSON document:
+    {
+        "users": {
+            "create": [
+                {
+                    "username": username
+                }, ...
+            "delete": [ "username", "username", ... ]
+        },
+        "volumes": {
+            "create": [
+                {
+                    "name": name
+                    "description": description
+                    "blocksize": blocksize
+                    "owner": username
+                    "private": private
+                    "archive": archive
+                }, ...
+            ]
+            "delete": [ "volume name", "volume name", ... ]
+        },
+        "gateways": {
+            "create": [
+                {
+                    "owner": username,
+                    "volume": volume,
+                    "instance": name_prefix,    # <-- e.g. the slice name
+                    "type": type,
+                    "host": hostname,
+                    "port": portnum
+                }, ...
+            ]
+            "delete": [
+                {
+                    "instance": name_prefix,
+                    "type": type,
+                    "host": host,
+                    "port": portnum
+                } ...
+            ]
+    }
+    """
+
+    client = rpc.make_rpc_client( config )
+
+    # add everything we need to 
+    rcs = []
+    rc, failed_users = provision_users_add( client, provision_plan['users'] )
+    rcs.append( rc )
+
+    rc, failed_volumes = provision_volumes_add( client, provision_plan['volumes'], failed_users=failed_users )
+    rcs.append( rc )
+
+    rc, failed_gateways = provision_gateways_add( client, provision_plan['gateways'], failed_users=failed_users, failed_volumes=failed_volumes )
+    rcs.append( rc )
+
+    # remove everything we need to 
+    rc = provision_gateways_remove( client, provision_plan['gateways'] )
+    rcs.append( rc )
+
+    rc = provision_volumes_remove( client, provision_plan['volumes'] )
+    rcs.append( rc )
+
+    rc = provision_users_remove( client, provision_plan['users'] )
+    rcs.append( rc )
+
+    # only succeed if everything succeeds;
+    # otherwise we should retry (since doing so is idempotent)
+    rc = True
+    for i in xrange(0, len(rcs)):
+        rc = rc and rcs[i]
+        if not rc:
+            break
+
+    return rc
+
+
+def main_provision( config, provision_plan_path=None ):
+    """
+    Provision command:
+    * grab the provision plan--either from the given path, or from stdin
+    * execute the provisioning
+    """
+    provision_text = None
+    provision_plan = None 
+
+    if provision_plan_path is not None:
+        with open(provision_plan_path, "r") as f:
+            provision_text = f.read()
+
+    else:
+        log.info("Reading provisioning info from stdin")
+        provision_text = sys.stdin.read()
+
+    try:
+        provision_plan = json.loads(provision_text)
+    except Exception, e:
+        log.exception(e)
+        log.error("FATAL: could not parse provisioning info")
+        sys.exit(1)
+
+    rc = provision( config, provision_plan )
+    return rc
+
+
+def main_server( config ):
+    """
+    Run as a server, and take requests.
+    bPeriodically fetch the provision plan.
+    """
+
+    server = GatewayProxy( config['amd_server_port'], config, config['amd_server_privkey'] )
+    log.debug("Serving on port %s" % config['amd_server_port'] )
+    server.serve_forever()
+    
+
+def get_config( argv ):
+    """
+    Get the configuration for this automount server
+    """
+
+    global AMD_SERVER_OPTIONS
+    
+    syndicate_config = conf.get_config_from_argv( argv )
+    amd_config = conf.get_extra_config( argv, "amd-server", AMD_SERVER_OPTIONS )
+    if amd_config is None:
+        log.error("FATAL: failed to load config")
+        sys.exit(1)
+
+    amd_pkey_path = amd_config.get('private_key', None)
+    amd_portnum = amd_config.get('portnum', None)
+
+    try:
+        assert amd_pkey_path is not None, "Missing private key"
+        amd_portnum = int(amd_portnum)
+    except AssertionError, e:
+        log.exception(e)
+        conf.print_parser_help( argv[0], "Automount server help", AMD_SERVER_OPTIONS )
+        sys.exit(1)
+    
+    pkey = storage.read_private_key( amd_pkey_path )
+    foreground = amd_config.get('foreground', False)
+    
+    try:
+        assert pkey is not None, "Unable to load private key '%s'" % amd_pkey_path
+    except AssertionError, e:
+        log.exception(e)
+        conf.print_parser_help( argv[0], "Automount client help", AMD_SERVER_OPTIONS )
+        sys.exit(1)
+    
+    pkey_pem = pkey.exportKey()
+
+    syndicate_config['amd_server_port'] = amd_portnum
+    syndicate_config['amd_server_privkey'] = pkey_pem
+    syndicate_config['amd_server_pubkey'] = pkey.publickey().exportKey()
+    syndicate_config['amd_foreground'] = foreground
+
+    return syndicate_config 
+
+
+def main( argv ):
+    """
+    Main method:
+    """
+    config = get_config( argv )
+    args = config['params']
+
+    if len(args) == 0:
+        print >> sys.stderr, "Usage: %s [server|provision|getinfo] [args...]" % sys.argv[0]
+        sys.exit(1)
+        
+    elif args[0] == 'server':
+        # start server
+        if len(args) > 1:
+            # optional argument: initial provision plan
+            log.debug("Initial provision plan: '%s'" % args[1])
+            rc = main_provision( config, provision_plan_path=args[1] )
+            if not rc:
+                sys.exit(1)
+
+        main_server( config )
+
+    elif args[0] == 'provision':
+        # provision gateways, using a provision plan
+        rc = False
+        if len(args) > 1:
+            rc = main_provision( config, provision_plan_path=args[1] )
+        else:
+            rc = main_provision( config )
+
+        if rc:
+            sys.exit(0)
+        else:
+            sys.exit(1)
+
+    elif args[0] == 'getinfo':
+        info_text = amd_handle_request( config, config['amd_server_privkey'], sys.stdin )
+        if info_text is None:
+            log.error("No data for this request")
+            sys.exit(1)
+
+        info = json.loads(info_text)
+        print json.dumps(info, indent=4, sort_keys=True)
+        sys.exit(0)
+
+    else:
+        print >> sys.stderr, "Usage: %s [server|provision|getinfo] [args...]" % sys.argv[0]
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main( sys.argv )

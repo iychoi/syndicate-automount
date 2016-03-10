@@ -1,0 +1,21 @@
+{
+   "users": {
+      "create": [],
+      "delete": ["testuser-001@rando.com"]
+   },
+   "volumes": {
+      "create": [],
+      "delete": ["foo.testvolume-001"]
+   },
+   "gateways": {
+      "create": [],
+      "delete": [
+         {
+            "volume": "foo.testvolume-001",
+            "type": "RG",
+            "host": "localhost"
+         }
+      ]
+   }
+}
+

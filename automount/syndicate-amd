@@ -1,0 +1,1105 @@
+#!/usr/bin/python 
+"""
+   Copyright 2016 The Trustees of Princeton University
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+"""
+
+# this daemon runs on each automount-managed host
+
+import sys
+import os
+import subprocess
+import base64 
+import threading
+import errno
+import copy
+import argparse
+import time
+import signal
+import json
+import random
+import socket
+
+from Crypto.PublicKey import RSA as CryptoKey
+
+import syndicate.util.provisioning as provisioning
+import syndicate.util.objects as object_stub
+import syndicate.util.paths as paths
+import syndicate.util.crypto as crypto
+import syndicate.util.client as rpcclient
+import syndicate.util.config as conf
+import syndicate.util.storage as storage
+import syndicate.syndicate as libsyndicate
+import syndicate.protobufs.ms_pb2 as ms_pb2
+
+log = conf.log 
+
+# gateway types...
+SYNDICATE_UG = 1
+SYNDICATE_RG = 2
+SYNDICATE_AG = 3
+
+AMD_DEFAULT_POLL_INTERVAL = 60
+AMD_DEFAULT_LOGDIR = os.path.expanduser( "~/.syndicate-amd-client/logs" )
+AMD_DEFAULT_MOUNTS = "/mnt/syndicate"
+
+# 'amd-client' section of the config file
+AMD_CLIENT_OPTIONS = {
+   "private_key":       ("-k", 1, "Path to the automount client's private key"),
+   "server":            ("-s", 1, "Automount server host:port"),
+   "instance_id":       ("-I", 1, "String that uniquely identifies this automount instance"),
+   "host":              ("-H", 1, "Hostname to use"),
+   "foreground":        ("-f", 0, "Run in the foreground"),
+   "poll_interval":     ("-t", 1, "Time in seconds between server polls"),
+   "portnum":           ("-p", 1, "Port to listen on for push notifications from the automount server"),
+   "logdir":            ("-l", 1, "Path to log directory (default is ~/.syndicate-amd-client/logs)"),
+   "mounts":            ("-M", 1, "Path to volume mount directories"),
+   "hostname":          ("-H", 1, "Hostname to use in requests")
+}
+
+AMD_CLIENT_GATEWAYS = {
+   "replica": paths.replica_gateway,
+   "acquisition": paths.acquisition_gateway,
+   "user-coordinator": paths.user_gateway_coordinator,
+   "user-filesystem": paths.user_gateway_filesystem
+}
+
+class AMDState(object):
+    """
+    Automount daemon state.
+    """
+    
+    def __init__(self, config, gateway_selector, debug=False, logdir=None):
+        self.procs = {}             # map gateway names to gateway processes
+        self.volume_table = {}      # map volume names to gateway names
+        self.gateway_table = {}     # map gateway names to volume names
+        self.gateway_types = {}     # map gateway names to gateway types
+        self.argfactories = {}      # map gateway types to functions with signature (self, gateway_cert)
+        self.exit_handlers = {}     # map gateway types to functions with signature (self, gateway-cert, exit_status)
+        self.lock = threading.Lock()
+        self.debug = debug
+        self.config = config
+
+        assert hasattr(gateway_selector, "__call__"), "Gateway selector argument must be a callable"
+        self.gateway_selector = gateway_selector
+
+        if logdir is None:
+            logdir = os.path.join( os.path.abspath( os.getcwd() ), "amd-logs" )
+
+        if not os.path.exists( logdir ):
+            try:
+                os.makedirs( logdir, 0700 )
+            except:
+                raise Exception("Failed to create log directory '%s'" % logdir )
+
+        self.logdir = logdir
+
+
+    def set_gateway_argfactory( self, gateway_type, argfactory ):
+        """
+        Set the exec argument factory for a gateway type.
+        """
+        self.argfactories[gateway_type] = argfactory
+
+
+    def set_gateway_exit_handler( self, gateway_type, handler ):
+        """
+        Set the restart-policy callback for this type of gateway
+        """
+        self.exit_handlers[gateway_type] = handler 
+
+
+    def get_gateway_exec_path( self, gateway_cert ):
+        """
+        Get the path to a gateway, by type
+        """
+        return self.gateway_selector( gateway_cert )
+
+
+    def get_gateway_extra_args( self, gateway_cert ):
+        """
+        Get the extra arguments for a gateway, by type
+        """
+        argfactory = self.argfactories.get( gateway_type, None )
+        if argfactory is None:
+            return []
+
+        else:
+            return argfactory( self, gateway_cert )
+
+
+    def make_gateway_args( self, volume_name, username, gateway_name, gateway_type ):
+        """
+        Get a list of arguments to start up a gateway.
+        """
+        # get cert...
+        gateway_cert = object_stub.load_gateway_cert( self.config, gateway_name )
+        assert gateway_cert is not None, "No cert on file for gateway '%s'" % gateway_name
+
+        exec_path = self.get_gateway_exec_path( gateway_cert )
+        arglist = [exec_path, "-f", "-v", volume_name, "-g", gateway_name, "-u", username]
+        if self.debug:
+            arglist += ["-d2"]
+
+        arglist += self.get_gateway_extra_args( gateway_cert )
+        return arglist
+
+
+    def make_gateway_logpath( self, volume_name, gateway_name ):
+        """
+        Create the path to the logs for a gateway
+        """
+        return os.path.join( self.logdir, volume_name, gateway_name ) + ".log"
+
+
+    def open_gateway_log( self, volume_name, gateway_name ):
+        """
+        Create the log file descriptors for a gateway we're starting.
+        """
+        logpath = self.make_gateway_logpath( volume_name, gateway_name )
+        if not os.path.exists( os.path.dirname( logpath ) ):
+            os.makedirs( os.path.dirname(logpath), 0700 )
+
+        logfd = open( logpath, "a" )
+        return logfd
+
+
+    def sigchld_handler(self):
+        """
+        Handle SIGCHLD: clean out dead gateways
+        """
+        dead = []
+        handler_info = []
+        exit_status = None
+
+        self.lock.acquire()
+
+        # which one(s) died?
+        for gateway_name in self.procs.keys():
+            proc = self.procs[gateway_name]
+            exit_status = proc.poll()
+            if exit_status is not None:
+                dead.append( (gateway_name, exit_status) )
+
+        self.lock.release()
+
+        for gateway_name, exit_status in dead:
+            volume_name, username, gateway_type = self.reap_gateway_process( gateway_name )
+            handler_info.append( (volume_name, username, gateway_name, gateway_type, exit_status) )
+
+        # inform exit handler
+        for volume_name, username, gateway_name, gateway_type, exit_status in dead:
+            exit_handler = self.exit_handlers.get( gateway_type, None )
+            if exit_handler is not None:
+                gateway_cert = object_stub.load_gateway_cert( self.config, gateway_name )
+                if gateway_cert is not None:
+                    # execute exit-handler 
+                    exit_handler( self, gateway_cert, exit_status )
+
+
+    def put_gateway_process( self, volume_name, username, gateway_name, gateway_type, proc ):
+        """
+        Save a running gateway process.
+        """
+        self.lock.acquire()
+
+        self.procs[ gateway_name ] = proc
+
+        if self.volume_table.has_key( volume_name ):
+            self.volume_table[ volume_name ].append( gateway_name )
+        else:
+            self.volume_table[ volume_name ] = [gateway_name]
+
+        self.gateway_table[ gateway_name ] = volume_name
+        self.gateway_types[ gateway_name ] = gateway_type
+        self.gateway_users[ gateway_name ] = username
+
+        self.lock.release()
+
+
+    def reap_gateway_process( self, gateway_name):
+        """
+        Clean out a dead gateway.
+        Return (volume_name, username, gateway_type) on success.
+        Return None if not reaped
+        """
+
+        volume_name = None
+        gateway_type = None 
+        username = None
+
+        self.lock.acquire()
+
+        if gateway_name in self.procs.keys():
+            proc = self.procs[gateway_name]
+            del self.procs[gateway_name]
+
+        if gateway_name in self.gateway_table.keys():
+            volume_name = self.gateway_table[gateway_name]
+            del self.gateway_table[gateway_name]
+
+            if volume_name in self.volume_table.keys():
+                if gateway_name in self.volume_table[volume_name]:
+                    self.volume_table[volume_name].remove( gateway_name )
+                    if len(volume_table[volume_name]) == 0:
+                        del self.volume_table[volume_name]
+
+        if gateway_name in self.gateway_types.keys():
+            gateway_type = self.gateway_types[ gateway_name ]
+            del self.gateway_types[ gateway_name ]
+
+        if gateway_name in self.gateway_users.keys():
+            username = self.gateway_users[ gateway_name ]
+            del self.gateway_users[ gateway_name ]
+
+        self.lock.release()
+        return (volume_name, username, gateway_type)
+
+
+    def start_gateway( self, volume_name, username, gateway_name, gateway_type ):
+        """
+        Start up a new gateway.
+        Return True on success
+        Return False on error
+        """
+        arglist = self.make_gateway_args( volume_name, username, gateway_name, gateway_type )
+        logfd = self.open_gateway_log( volume_name, gateway_name )
+
+        p = subprocess.Popen( arglist, shell=False, stdin=None, stdout=logfd, stderr=logfd, close_fds=True )
+        if p is None:
+            log.error("Failed to start '%s' (%s)" % (gateway_name, p.pid))
+            return False
+
+        log.debug("Started '%s' (%s)" % (gateway_name, p.pid) )
+    
+        self.put_gateway_process( volume_name, username, gateway_name, gateway_type, p )
+        return True
+
+
+    def stop_gateway( self, gateway_name ):
+        """
+        Stop a gateway
+        """
+
+        log.debug("Stop gateway '%s'" % gateway_name)
+        self.lock.acquire()
+
+        proc = self.procs.get(gateway_name, None)
+        if proc is not None:
+            try:
+                proc.kill()
+            except:
+                pass
+
+        self.lock.release()
+        
+        # sigchld handler takes care of the rest
+        return
+
+
+    def start_volume( self, volume_name, usernames, gateway_names, gateway_types ):
+        """
+        Start up a volume's gateways.
+        Return True on success.
+        Return False on error.
+        """
+
+        assert len(usernames) == len(gateway_names), "Unequal numbers of users and gateways"
+        assert len(gateway_names) == len(gateway_types), "Unequal numbers of gateways and types"
+
+        final_rc = True
+        log.debug("Start gateways in volume '%s'" % volume_name)
+        for username, gateway_name, gateway_type in zip(usernames, gateway_names, gateway_types):
+            rc = self.start_gateway( volume_name, username, gateway_name, gateway_type )
+            if not rc:
+                final_rc = False
+
+        return final_rc
+
+
+    def stop_volume( self, volume_name ):
+        """
+        Stop a volume's gateways
+        """
+
+        log.debug("Stop gateways in volume '%s'" % volume_name)
+
+        self.lock.acquire()
+        gateway_names = self.volume_table[volume_name][:]
+        self.lock.release()
+
+        log.debug("Stop volume '%s'" % volume_name)
+        for gateway_name in gateway_names:
+            self.stop_gateway( gateway_name )
+
+
+    def is_gateway_running( self, gateway_name ):
+        """
+        Is a gateway running?
+        """
+        self.lock.acquire()
+        rc = (gateway_name in self.procs.keys())
+        self.lock.release()
+        return rc
+
+
+    def volume_info_diff( self, new_volume_info ):
+        """
+        Given unpacked volume information, find the
+        subset of it that corresponds to volumes and
+        gateways that we don't know about, and the
+        list of gateways that do not exist anymore.
+        """
+
+        self.lock.acquire()
+        cur_volume_table = copy.deepcopy( self.volume_table )
+        cur_gateway_table = copy.deepcopy( self.gateway_table )
+        self.lock.release()
+
+        new_volume_diff = {}
+        old_gateways = []
+
+        for new_volume in new_volume_info.keys():
+            cur_volume_gateways = cur_volume_table.get( new_volume, None )
+            if cur_volume_gateways is None:
+                # completely new volume 
+                new_volume_diff[new_volume] = new_volume_info[new_volume]
+
+            else:
+                # volume is already present.
+                # find new gateway info
+                for gateway_name in new_volume_info.keys():
+                    if gateway_name == "__pkey__":
+                        continue 
+
+                    if gateway_name not in cur_volume_table[cur_volume]:
+                        # new gateway 
+                        if volume_name in new_volume_info.keys():
+                            new_volume_diff[volume_name][gateway_name] = new_volume_info[cur_volume][gateway_name]
+
+                        else:
+                            new_volume_diff[volume_name] = { gateway_name: new_volume_info[cur_volume][gateway_name] }
+
+                        # propagate initial private key
+                        if "__pkey__" not in new_volume_diff[volume_name].keys():
+                            new_volume_diff[volume_name]["__pkey__"] = new_volume_info[volume_name]["__pkey__"]
+
+
+        for cur_volume in cur_volume_table.keys():
+            if cur_volume not in new_volume_info.keys():
+                # volume is dead 
+                old_gateways += cur_volume_table[cur_volume]
+
+            else:
+                # volume is still here.
+                # find now-dead gateways 
+                for gateway_name in cur_volume_table[cur_volume]:
+                    if gateway_name not in new_volume_info[cur_volume]:
+                        old_gateways.append( gateway_name )
+
+
+        return new_volume_diff, old_gateways
+
+
+
+def helper_run( helper_path, stdin_string, *args ):
+    """
+    Run a helper program, and gather its results.
+    Return its results as a JSON document.
+    Return None on error
+    """
+     
+    if not os.path.exists( helper_path ):
+        log.error("Not found: %s" % helper_path )
+        return None
+
+    stdin = None 
+    if stdin_string is not None:
+        stdin = subprocess.PIPE
+
+    helper = subprocess.Popen( [helper_path] + [str(a) for a in args], shell=False, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE )
+    helper_out, helper_err = helper.communicate( input=stdin_string )
+    helper.wait()
+
+    if len(helper_err.strip()) != 0:
+        log.error("helper errors: %s" % helper_err)
+
+    if helper.returncode != 0:
+        log.error("helper '%s' exited %s" % (helper_path,helper.returncode))
+        return None
+
+    try:
+        helper_json = json.loads(helper_out)
+    except Exception, e:
+        log.exception(e)
+        log.error("Failed to parse output of '%s'" % helper_path)
+        return None
+
+    return helper_json
+
+
+def poll_server_pubkey( instance_id, server_host, server_port ):
+    """
+    Fetch the AMD server's public key
+    """
+    server_pubkey = helper_run( paths.poll_server_pubkey, None, instance_id, server_host, server_port )
+    if server_pubkey is None:
+        log.error("Failed to load automount server public key")
+        return None
+
+    assert 'public_key' in server_pubkey, "Invalid JSON response: expected 'public_key'"
+
+    # will be serialized--replace \\n with \n
+    server_pubkey = server_pubkey['public_key'].replace("\\n", "\n")
+
+    try:
+        pubkey = CryptoKey.importKey( server_pubkey )
+    except Exception, e:
+        log.error("Invalid public key")
+        raise 
+
+    return server_pubkey
+
+
+def unpack_volume_info( amd_pubkey_pem, client_privkey_pem, volume_info ):
+    """
+    Validate and unpack the volume info we obtained:
+    * extract the encrypted private key 
+    * parse each gateway certificate
+    """
+
+    ret = {}
+    for volume_name in volume_info.keys():
+       
+        assert "gateways" in volume_info[volume_name].keys(), "Missing gateway info"
+        gateway_info = volume_info[volume_name]["gateways"]
+
+        assert "users" in volume_info[volume_name].keys(), "Missing user info"
+        user_info = volume_info[volume_name]["users"]
+
+        # unpack gateway info...
+        assert "__pkey__" in gateway_info, "Missing encrypted gateway private key"
+
+        gateway_pkey_enc = base64.b64decode( gateway_info["__pkey__"] )
+        rc, pkey_pem = libsyndicate.decrypt_data( amd_pubkey_pem, client_privkey_pem, gateway_pkey_enc )
+        if rc != 0:
+            log.error("Failed to decrypt, rc = %d" % rc)
+            return None
+
+        # unpack gateway certs and pkey
+        unpacked_gateway_info = {
+            "__pkey__": pkey_pem
+        }
+
+        for gateway_name in gateway_info.keys():
+            if gateway_name == "__pkey__":
+                continue 
+
+            cert_info = None
+            try:
+                cert_info = ms_pb2.ms_gateway_cert()
+                cert_str = base64.b64decode( gateway_info[gateway_name] )
+                cert_info.ParseFromString( cert_str )
+
+                assert cert_info.name == gateway_name, "Mismatched gateway name"
+            except Exception, e:
+                log.exception(e)
+                log.error("Failed to parse gateway cert for '%s'" % gateway_name)
+                return None
+                
+            unpacked_gateway_info[gateway_name] = cert_info 
+
+
+        # unpack user info 
+        unpacked_user_info = {}
+        for user_id_str in user_info.keys():
+
+            assert "cert" in user_info[user_id_str], "Missing user cert"
+            assert "pkey" in user_info[user_id_str], "Missing encrypted pkey"
+
+            user_pkey_enc = base64.b64decode( user_info[user_id_str]['pkey'] )
+            rc, user_pkey = libsyndicate.decrypt_data( amd_pubkey_pem, client_privkey_pem, user_pkey_enc )
+            if rc != 0:
+                log.error("Failed to decrypt, rc = %d" % rc)
+                return None 
+
+            cert_info = None
+            try:
+                cert_info = ms_pb2.ms_user_cert()
+                cert_str = base64.b64decode( user_info[user_id_str]['cert'] )
+                cert_info.ParseFromString( cert_str )
+
+                assert str(cert_info.user_id) == user_id_str, "Mismatched user ID"
+            except Exception, e:
+                log.exception(e)
+                log.error("Failed to parse user cert for '%s'" % user_id_str)
+                return None 
+
+            unpacked_user_info[user_id_str] = {
+                "cert": cert_info,
+                "pkey": user_pkey,
+            }
+
+        ret[volume_name] = {
+            "gateways": unpacked_gateway_info,
+            "users": unpacked_user_info
+        }
+
+    return ret
+
+
+def parse_volumes( amd_client_privkey, amd_server_pubkey, signed_volume_info_text ):
+    """
+    Given the automount server's public key and its response to our
+    request for gateways, parse and unpack the listing.  Make sure
+    the server signed the message.
+    """
+
+    # unpack... 
+    rc, serialized_volume_info_txt = crypto.verify_and_parse_json( amd_server_pubkey, signed_volume_info_text )
+    if rc != 0 or serialized_volume_info_txt is None:
+        log.error("Failed to verify and parse volume server response")
+        return None 
+
+    try:
+        serialized_volume_info = json.loads( serialized_volume_info_txt )
+    except Exception, e:
+        log.exception(e)
+        log.error("Failed to parse volume info")
+        return None 
+
+    # validate 
+    volume_info = unpack_volume_info( amd_server_pubkey, amd_client_privkey, serialized_volume_info )
+    return volume_info 
+
+
+def poll_volumes( amd_client_privkey, amd_server_pubkey, amd_client_host, amd_instance_id, amd_server_host, amd_server_port ):
+    """
+    Get the list of volumes and gateways to spawn (a provisioning plan)
+    """
+    signed_volume_info = helper_run( paths.poll_volumes, amd_client_privkey, amd_client_host, amd_instance_id, amd_server_host, amd_server_port )
+    if signed_volume_info is None:
+        log.error("Failed to fetch volume info")
+        return None 
+
+    signed_volume_info_text = json.dumps( signed_volume_info )
+    return parse_volumes( amd_client_privkey, amd_server_pubkey, signed_volume_info_text )
+
+
+def gateway_update_key( client, gateway_name, private_key_pem ):
+    """
+    Set a gateway's keypair.
+    """
+    try:
+        rc = client.update_gateway( gateway_name, private_key=private_key_pem )
+        assert rc, "Update failed"
+    except Exception, e:
+        log.exception(e)
+        return False 
+
+    return True 
+
+
+def gateway_ensure_key_updated( client, gateway_name, private_key_pem ):
+    """
+    Ensure that a gateway's private key has been regenerated, and is thus
+    different from the initial private key the AMD server gave us.
+    @private_key_pem is the AMD-given key.
+    """
+
+    need_update = False
+    gateway_pkey = storagelib.load_private_key( client.config, "gateway", gateway_name )
+    if gateway_pkey is None:
+        # no key on file
+        need_update = True 
+
+    else:
+        need_update = (private_key_pem == gateway_pkey.exportKey())
+
+    if need_update:
+        # re-generate and update 
+        pubkey_pem, privkey_pem = crypto.generate_key_pair( msconfig.OBJECT_KEY_SIZE )
+        rc = gateway_update_key( client, gateway_name, privkey_pem )
+        if not rc:
+            log.error("Failed to update key for gateway '%s'" % gateway_name )
+
+        return rc
+
+    else:
+        return True
+
+
+def user_info_install( config, user_cert, user_privkey_pem ):
+    """
+    Given a user's automount server info, put it in place.
+    """
+    privkey = CryptoKey.importKey( user_privkey_pem )
+    storagelib.store_private_key( config, "user", user_cert.email, privkey, overwrite=True )
+    object_stub.store_user_cert( config, user_cert )
+
+
+def user_info_remove( config, user_id ):
+    """
+    Given a user's ID, remove its cert and private key
+    """
+    user_cert = object_stub.load_user_cert( config, user_id )
+    if user_cert is None:
+        log.error("No user cert on file for '%s'" % user_id)
+        return 
+
+    storagelib.erase_private_key( config, "user", user_cert.email )
+    object_stub.remove_user_cert( config, user_cert.email )
+
+
+def gateway_info_install( config, gateway_cert, gateway_privkey_pem ):
+    """
+    Given a gateway's automount server info, put it in place.
+    """
+    privkey = CryptoKey.importKey( gateway_privkey_pem )
+    storagelib.store_private_key( config, "gateway", gateway_cert.name, privkey, overwrite=True )
+    object_stub.store_gateway_cert( config, gateway_cert )
+
+
+def gateway_info_remove( config, gateway_name ):
+    """
+    Given a gateway's name, remove its cert and private key
+    """
+    storagelib.erase_private_key( config, "gateway", gateway_name )
+    object_stub.remove_gateway_cert( config, gateway_name )
+
+
+def start_gateways( amd_state, volume_info ):
+    """
+    Given a set of volume information for gateways that we need to start (and the
+    info for the users that own them), go install their keys, update them to a private
+    gateway key if needed, and start them up.
+
+    volume_info must be unpacked first.
+
+    Return True if the volume info was processed.
+    Return False if not.
+    The caller should keep calling this method until it returns true.
+    """
+
+    final_rc = True
+    gateways_installed = []
+    client = rpcclient.make_rpc_client( amd_state.config )
+
+    for volume_name in volume_info.keys():
+        
+        info = volume_info[volume_name]
+        gateway_infos = info['gateways']
+        gateway_initial_pkey = gateway_infos['__pkey__']
+        user_infos = info['users']
+
+        # map gateway name to user name
+        gateway_users = {}
+        for gateway_name, gateway_cert_str in gateway_infos.items():
+            for user_id_str, user_info in user_infos.items():
+                if gateway_cert.owner_id == int(user_id_str):
+                    gateway_users[ gateway_cert.name ] = user_info['cert'].email
+                    break
+
+        for user_id_str, user_info in user_infos.items():
+
+            # install this user 
+            user_info_install( amd_state.config, user_info['cert'], user_info['pkey'] )
+
+        for gateway_name, gateway_cert in gateway_infos.items():
+
+            # install this gateway 
+            gateway_info_install( amd_state.config, gateway_cert, gateway_initial_pkey )
+
+            # ensure the gateway's pkey is different from the AMD server-given one
+            rc = gateway_ensure_key_updated( client, gateway_name, gateway_initial_pkey )
+            if not rc:
+                log.error("Failed to set up key for gateway '%s'" % gateway_name )
+                final_rc = False
+                continue 
+
+            # start this gateway, if not running
+            if not_amd_state.is_gateway_running( gateway_name ):
+                rc = amd_state.start_gateway( volume_name, gateway_users[gateway_name], gateway_name, gateway_infos[gateway_name].gateway_type )
+                if not rc:
+                    log.error("Failed to start gateway '%s' in '%s'" % (gateway_name, volume_name))
+                    final_rc = False 
+                    continue 
+
+    return final_rc
+
+
+def reprovision( amd_state ):
+    """
+    Top-level method:
+    * fetch the current volume information.
+    * validate and parse it.
+    * start all new gateways
+    * stop now-detached gateways
+
+    Return true if all is well.
+    Return False if not (in which case, the caller should try again)
+    """
+    client_privkey = amd_state.config.get('amd_client_privkey', None)
+    server_host = amd_state.config.get('amd_server_host', None)
+    server_port = amd_state.config.get('amd_server_port', None)
+    instance_id = amd_state.config.get('amd_instance_id', None)
+    server_pubkey = amd_state.config.get('amd_server_pubkey', None)
+    client_host = amd_state.config.get('amd_client_host', None)
+
+    assert client_privkey is not None, "No client private key"
+    assert server_pubkey is not None, "No server public key"
+    assert server_host is not None, "No server host"
+    assert server_port is not None, "No server port"
+    assert instance_id is not None, "No instance ID"
+    assert client_host is not None, "No client host"
+
+    log.debug("Poll volumes")
+    volume_info = poll_volumes( client_privkey, server_pubkey, client_host, instance_id, server_host, server_port )
+    if volume_info is None:
+        log.error("No volume info obtained")
+        return False
+
+    new_volume_info, old_gateways = amd_state.volume_info_diff( volume_info )
+
+    # start up new gateways 
+    final_rc = True
+    
+    log.debug("Start gateways")
+    rc = start_gateways( amd_state, new_volume_info )
+    if not rc:
+        final_rc = False
+
+    # stop dead gateways 
+    for old_gateway_name in old_gateways:
+        rc = amd_state.stop_gateway( old_gateway_name )
+        if not rc:
+            log.error("Failed to stop gateway '%s'" % old_gateway_name )
+            final_rc = False
+
+    return final_rc
+
+
+def get_config( argv ):
+    """
+    Get the configuration for this automount client
+    """
+
+    global AMD_CLIENT_OPTIONS
+    
+    syndicate_config = conf.get_config_from_argv( argv )
+    amd_config = conf.get_extra_config( argv, "amd-client", AMD_CLIENT_OPTIONS )
+
+    amd_server = amd_config.get('server', None)
+    amd_pkey_path = amd_config.get('private_key', None)
+    amd_instance_id = amd_config.get('instance_id', None)
+    amd_mounts = amd_config.get('mounts', AMD_DEFAULT_MOUNTS )
+
+    if not os.path.exists( amd_mounts ):
+        # try to make it 
+        try:
+            os.makedirs( amd_mounts )
+        except Exception, e:
+            log.exception(e)
+            log.error("Failed to create mount directory '%s'" % amd_mounts)
+            sys.exit(1)
+
+    try:
+        assert amd_server is not None, "Missing server"
+        assert amd_pkey_path is not None, "Missing private key"
+        assert amd_instance_id is not None, "Missing instance ID"
+
+        assert os.path.isdir( amd_mounts ), "Not a directory: %s" % amd_mounts
+        assert os.access( amd_mounts, os.X_OK | os.W_OK ), "Permission denied: %s" % amd_mounts
+
+    except AssertionError, e:
+        log.exception(e)
+        conf.print_parser_help( argv[0], "Automount client help", AMD_CLIENT_OPTIONS )
+        sys.exit(1)
+
+    host, port, _ = rpcclient.parse_url( amd_server )
+    pkey = storage.read_private_key( amd_pkey_path )
+    foreground = amd_config.get('foreground', False)
+    push_port = amd_config.get('portnum', None)
+    poll_interval = amd_config.get("poll_interval", AMD_DEFAULT_POLL_INTERVAL )
+    logdir = amd_config.get('logdir', AMD_DEFAULT_LOGDIR )
+    client_host = amd_config.get('hostname', socket.gethostname() )
+
+    if push_port is not None:
+        try:
+            push_port = int(push_port)
+        except Exception, e:
+            log.exception(e)
+            conf.print_parser_help( argv[0], "Automount client help", AMD_CLIENT_OPTIONS )
+            sys.exit(1)
+
+    if poll_interval is not None:
+        try:
+            poll_interval = int(poll_interval)
+        except Exception, e:
+            log.exception(e)
+            conf.print_parser_help( argv[0], "Automount client help", AMD_CLIENT_OPTIONS )
+            sys.exit(1)
+
+    try:
+        assert pkey is not None, "Unable to load private key '%s'" % amd_pkey_path
+    except AssertionError, e:
+        log.exception(e)
+        conf.print_parser_help( argv[0], "Automount client help", AMD_CLIENT_OPTIONS )
+        sys.exit(1)
+    
+    pkey_pem = pkey.exportKey()
+
+    # get the amd server's public key
+    server_pubkey = poll_server_pubkey( amd_instance_id, host, port )
+    if server_pubkey is None:
+        return False
+
+    syndicate_config['amd_server_host'] = host
+    syndicate_config['amd_server_port'] = port
+    syndicate_config['amd_instance_id'] = amd_instance_id
+    syndicate_config['amd_client_privkey'] = pkey_pem.strip()
+    syndicate_config['amd_foreground'] = foreground
+    syndicate_config['amd_push_port'] = push_port
+    syndicate_config['amd_poll_interval'] = poll_interval
+    syndicate_config['amd_logdir'] = logdir
+    syndicate_config['amd_mounts'] = amd_mounts
+    syndicate_config['amd_server_pubkey'] = server_pubkey.strip()
+    syndicate_config['amd_client_host'] = client_host
+
+    return syndicate_config 
+
+
+def is_UG_filesystem( gateway_cert ):
+    """
+    Does a gateway cert correspond to a filesystem to mount?
+    """
+    if gateway_cert.gateway_type != SYNDICATE_UG:
+        return False 
+
+    ug_read_caps = ms_pb2.ms_gateway_cert.CAP_READ_DATA | ms_pb2.ms_gateway_cert.CAP_READ_METADATA
+    ug_write_caps = ms_pb2.ms_gateway_cert.CAP_WRITE_DATA | ms_pb2.ms_gateway_cert.CAP_WRITE_METADATA
+
+    if (gateway_cert.caps & (ug_read_caps & ug_write_caps)) != 0:
+        # UG that will be user-accessible 
+        return True
+
+    else:
+        return False
+
+
+def select_gateway_path( gateway_cert ):
+    """
+    Given a gateway certificate, select the path to the executable
+    to launch.
+
+    The policy here is to launch the gateways by type, except for the UG:
+    * if the UG has no read/write capabilities, then launch a coordinator.
+    * otherwise, launch a filesystem.
+    """
+
+    if gateway_cert.gateway_type == SYNDICATE_AG:
+        return paths.acquisition_gateway
+
+    elif gateway_cert.gateway_type == SYNDICATE_RG:
+        return paths.replica_gateway
+
+    elif gateway_cert.gateway_type == SYNDICATE_UG:
+        if is_UG_filesystem( gateway_cert ):
+            return paths.user_gateway_filesystem
+        else:
+            return paths.user_gateway_coordinator
+
+
+def UG_mountpoint_args( amd_state, gateway_cert ):
+    """
+    Given a gateway cert, return the extra arguments
+    needed to start a UG.
+    This would be the mountpoint.
+    """
+
+    if is_UG_filesystem( gateway_cert ):
+        mountpoint_dir = amd_state.config['amd_mounts']
+        volume_cert = object_stub.load_volume_cert( amd_state.config, gateway_cert.volume_id )
+        assert volume_cert is not None, "No cert on file for volume %s" % gateway_cert.volume_id
+        return [os.path.join( mountpoint_dir, volume_cert.name, gateway_cert.name )]
+
+    else:
+        return []
+
+
+def gateway_restart( amd_state, gateway_cert, exit_status ):
+    """
+    Restart policy for our gateways:
+    * restart failed RGs and AGs
+    * unmount and restart failed UG filesystems
+
+    Log the crash either way
+    Return True on success
+    Return False on failure to restart when we should have
+    """
+
+    log.info("Gateway '%s' exit status %s" % (gateway_cert.name, exit_status))
+
+    # exit on signal?
+    if exit_status < 0:
+        # told to exit?
+        if -exit_status in [signal.SIGTERM, signal.SIGKILL, signal.SIGINT, signal.SIGQUIT]:
+            # do nothing--was told to exit
+            return True
+
+    else:
+        if exit_status == 0:
+            # told to exit
+            return True
+    
+    # died unexpectedly.  restart.
+    # if this is a UG filesystem, then unmount it 
+    if is_UG_filesystem( gateway_cert ):
+        mountpoint = UG_mountpoint_args( amd_state, gateway_cert )[0]
+        os.system("fusermount -u \"%s\"" % mountpoint)
+
+    volume_cert = object_stub.load_volume_cert( amd_state.config, gateway_cert.volume_id )
+    user_cert = object_stub.load_user_cert( amd_state.config, gateway_cert.owner_id )
+
+    if volume_cert is None:
+        # no more volume 
+        return False
+
+    if user_cert is None:
+        # no more user 
+        return False
+
+    rc = amd_state.start_gateway( volume_cert.name, user_cert.email, gateway_cert.name, gateway_cert.gateway_type )
+    if not rc:
+        log.error("Failed to restart gateway '%s' (%s)\n" % (gateway_cert.name, gateway_cert.gateway_id))
+        return False 
+
+    else:
+        return True
+
+
+def TEST_select_gateway_path( gateway_cert ):
+    """
+    Given a gateway certificate, select the path to the executable
+    to launch.
+
+    The policy here is to launch the gateways by type, except for the UG:
+    * if the UG has no read/write capabilities, then launch a coordinator.
+    * otherwise, launch a filesystem.
+    """
+
+    if gateway_cert.gateway_type == SYNDICATE_AG:
+        return "/tmp/mock-syndicate-ag"
+
+    elif gateway_cert.gateway_type == SYNDICATE_RG:
+        return "/tmp/mock-syndicate-rg"
+
+    elif gateway_cert.gateway_type == SYNDICATE_UG:
+        return "/tmp/mock-syndicate-ug"
+
+    return None
+
+
+def main( config, run_once=False, gateway_path_func=None ):
+    """
+    Main loop:
+    * poll the volumes every so often and reprovision
+    * optionally wait to be woken up by the automount server
+    """
+
+    poll_interval = config['amd_poll_interval']
+    logdir = config['amd_logdir']
+
+    if gateway_path_func is None:
+        gateway_path_func = select_gateway_path 
+
+    amd_state = AMDState( config, gateway_path_func, debug=config['debug'], logdir=logdir )
+
+    amd_state.set_gateway_argfactory( SYNDICATE_UG, UG_mountpoint_args )
+
+    amd_state.set_gateway_exit_handler( SYNDICATE_UG, gateway_restart )
+    amd_state.set_gateway_exit_handler( SYNDICATE_RG, gateway_restart )
+    amd_state.set_gateway_exit_handler( SYNDICATE_AG, gateway_restart )
+
+    log.debug("Entering main loop")
+    while True:
+
+        delay = 1.0
+        while True:
+            # try to reprovision, with exponential back-off on failure
+            rc = reprovision( amd_state )
+            if not rc:
+                delay = 2 * delay + (random.random() * delay)
+                log.warn("Reprovisioning failed; sleeping %s and trying again" % delay)
+                time.sleep(delay)
+
+            else:
+                log.debug("Successfully reprovisioned")
+                break
+
+        try:
+            time.sleep(poll_interval)
+        except:
+            # interrupt 
+            break
+
+        if run_once:
+            break
+
+    return
+
+
+if __name__ == "__main__":
+    config = get_config( sys.argv )
+    args = config['params']
+
+    if len(args) > 0:
+        if args[0] == 'make_request':
+            if len(args) != 3:
+                print >> sys.stderr, "Usage: %s make_request [hostname] [instance]" % sys.argv[0]
+                sys.exit(1)
+
+            # generate a request and write it to stdout
+            hostname = args[1]
+            instance = args[2]
+            request = {
+                "hostname": hostname,
+                "instance": instance
+            }
+            request_txt = json.dumps(request)
+            pkey = CryptoKey.importKey( config['amd_client_privkey'] )
+            signed_json_text = crypto.sign_and_serialize_json( pkey, request_txt, toplevel_fields={'hostname': hostname} )
+            print signed_json_text
+            sys.exit(0)
+
+
+        elif args[0] == 'parse':
+            # read amd server request response from stdin and print out the unpacked volume data
+            log.debug("Reading automount server's response from stdin....")
+            amd_response = sys.stdin.read()
+            volume_info = parse_volumes( config['amd_client_privkey'], config['amd_server_pubkey'], amd_response )
+
+            import pprint 
+            pp = pprint.PrettyPrinter( indent=4, width=130 )
+            pp.pprint( volume_info )
+            sys.exit(0)
+
+
+        elif args[0] == 'reprovision':
+            # for testing purposes: start up and supervise gateways.  do not poll for more info.
+            log.warning("Testing method: reprovision")
+            main( config, gateway_path_func=TEST_select_gateway_path, run_once=True )
+
+    else:
+        main( config ) 

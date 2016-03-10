@@ -1,0 +1,139 @@
+#!/usr/bin/python 
+"""
+   Copyright 2016 The Trustees of Princeton University
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+"""
+
+"""
+Daemon for signing keys given by other slivers on this host.
+"""
+
+import os
+import sys
+import BaseHTTPServer
+import logging
+import base64
+
+from Crypto.Hash import SHA256 as HashAlg
+from Crypto.PublicKey import RSA as CryptoKey
+from Crypto import Random
+from Crypto.Signature import PKCS1_PSS as CryptoSigner
+from Crypto.Protocol.KDF import PBKDF2
+
+KEY_SIGNER_PORT = 37360
+DEBUG = True
+
+log = logging.getLogger()
+if len(log.handlers) == 0:
+    log.setLevel(logging.DEBUG if DEBUG else logging.INFO)
+    console = logging.StreamHandler()
+    console.setLevel(logging.DEBUG if DEBUG else logging.INFO)
+    log_format = ('[%(levelname)s] [%(module)s:%(lineno)d] (' + str(os.getpid()) + ') %(message)s' if DEBUG else '%(message)s')
+    formatter = logging.Formatter(log_format)
+    console.setFormatter(formatter)
+    log.propagate = False
+    log.addHandler(console)
+
+
+def sign_data( privkey, data ):
+   """
+   Given a loaded private key and a string of data,
+   generate and return a signature over it.
+   """
+   h = HashAlg.new( data )
+   signer = CryptoSigner.new(privkey)
+   signature = signer.sign( h )
+   return signature
+
+
+class KeySignerServer( BaseHTTPServer.HTTPServer ):
+
+    def __init__( self, port, private_key_path ):
+
+        BaseHTTPServer.HTTPServer.__init__( self, ("127.0.0.1", port), KeySignerHandler )
+        
+        with open( private_key_path ) as f:
+            private_key_text = f.read()
+        
+        self.private_key = CryptoKey.importKey( private_key_text )
+        self.public_key = self.private_key.publickey()
+        self.private_key_text = self.private_key.exportKey()
+        self.public_key_text = self.public_key.exportKey()
+
+
+
+class KeySignerHandler( BaseHTTPServer.BaseHTTPRequestHandler ):
+
+    def do_GET(self):
+        """
+        Give back the public key
+        """
+        self.send_response( 200 )
+        self.send_header( "content-type", "text/plain" )
+        self.send_header( "content-length", len(self.server.public_key_text) )
+        self.end_headers()
+        self.wfile.write( self.server.public_key_text )
+        return 
+
+
+    def do_POST(self):
+        """
+        Sign the given data with the private key,
+        and give back the signature.
+        """
+        data_len = self.headers.get('content-length', None)
+        if data_len is None:
+            self.send_response( 400 )
+            self.end_headers()
+            return 
+
+        try:
+            data_len = int(data_len)
+        except:
+            self.send_response( 400 )
+            self.end_headers()
+            return
+
+        data = self.rfile.read( data_len )
+        sig = sign_data( self.server.private_key, data )
+        sigb64 = base64.b64encode( sig )
+
+        self.send_response( 200 )
+        self.send_header( "content-type", "text/plain" )
+        self.send_header( "content-length", len(sigb64) )
+        self.end_headers()
+        self.wfile.write( sigb64 )
+        return
+
+
+if __name__ == "__main__":
+
+    port = KEY_SIGNER_PORT
+    usage = "Usage: %s /path/to/private/key [port]" % sys.argv[0]
+
+    if len(sys.argv) < 2:
+        print >> sys.stderr, usage
+        sys.exit(1)
+
+    private_key_path = sys.argv[1]
+
+    if len(sys.argv) > 2:
+        try:
+            port = int( sys.argv[2] )
+        except:
+            print >> sys.stderr, "Usage: $s [port]" % sys.argv[0]
+            sys.exit(1)
+
+    server = KeySignerServer( port, private_key_path )
+    server.serve_forever()

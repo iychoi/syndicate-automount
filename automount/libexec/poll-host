@@ -1,0 +1,75 @@
+#!/usr/bin/python
+"""
+   Copyright 2016 The Trustees of Princeton University
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+"""
+
+# run by syndicate-amd-server to get a host's information,
+# such as its public key.
+
+import os
+import sys
+import json
+import copy
+
+
+def TEST_fetch_host_info( hostname ):
+    """
+    Given a hostname, resolve it to a JSON document
+    with the following fields:
+    * public_key: public key string (RSA 4096-bit)
+    """
+    if os.path.exists("/tmp/test-poll-host-pubkey.pub"):
+        with open("/tmp/test-poll-host-pubkey.pub", "r") as f:
+            pubk = f.read()
+            host_info = {}
+            host_info['hostname'] = hostname
+            host_info['public_key'] = pubk.strip()
+            return host_info 
+
+    raise Exception("Missing /tmp/test-poll-host-pubkey.pub")
+
+
+def opencloud_fetch_host_info( hostname ):
+    """
+    Given a hostname, resolve it to a JSON document
+    with the following fields:
+    * public_key: public key string (RSA 4096-bit)
+    """
+    raise Exception("Opencloud support not implemented")
+
+
+fetch_host_info = TEST_fetch_host_info
+
+
+if __name__ == "__main__":
+    """
+    Fetch the host info
+    """
+    usage = "Usage: %s hostname" % sys.argv[0]
+    if len(sys.argv) != 2:
+        print >> sys.stderr, usage
+        sys.exit(1)
+
+    host_info = fetch_host_info( sys.argv[1] )
+    try:
+        print json.dumps(host_info, indent=4, sort_keys=True)
+        sys.exit(0)
+    except Exception, e:
+        print >> sys.stderr, "Invalid JSON"
+        sys.exit(1)
+    
+
+
+
