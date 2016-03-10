@@ -294,6 +294,7 @@ def amd_get_info( config, request, host_info ):
 
         # find all associated user certs and their private keys, and serialize them
         user_certs = {}
+        serialized_gateway_certs = {}
         for gateway_cert in gateway_certs:
 
             # user cert
@@ -321,10 +322,7 @@ def amd_get_info( config, request, host_info ):
                 "pkey": base64.b64encode( user_pkey_pem_enc )
             }
 
-        # serialize and b64-encode 
-        gateway_certs = {}
-        for gwc in gateway_certs:
-            gateway_certs[ gwc.name ] = base64.b64encode( gwc.SerializeToString() )
+            serialized_gateway_certs[gateway_cert.name] = base64.b64encode( gateway_cert.SerializeToString() )
 
         # encrypt the private key for this volume's gateways...
         pkey_pem = get_gateway_initial_pkey( config, volume_name )
@@ -337,11 +335,11 @@ def amd_get_info( config, request, host_info ):
             log.error("Failed to encrypt response; rc = %d\n", rc)
             return {}
 
-        gateway_certs["__pkey__"] = base64.b64encode( pkey_pem_enc )
+        serialized_gateway_certs["__pkey__"] = base64.b64encode( pkey_pem_enc )
 
         # done with this volume
         ret[volume_name] = {
-            "gateways": gateway_certs,
+            "gateways": serialized_gateway_certs,
             "users": user_certs
         }
 
