@@ -54,6 +54,9 @@ AMD_DEFAULT_POLL_INTERVAL = 60
 AMD_DEFAULT_LOGDIR = os.path.expanduser( "~/.syndicate-amd-client/logs" )
 AMD_DEFAULT_MOUNTS = "/mnt/syndicate"
 
+# global automount state
+g_amd_state = None
+
 # 'amd-client' section of the config file
 AMD_CLIENT_OPTIONS = {
    "private_key":       ("-k", 1, "Path to the automount client's private key"),
@@ -85,6 +88,7 @@ class AMDState(object):
         self.volume_table = {}      # map volume names to gateway names
         self.gateway_table = {}     # map gateway names to volume names
         self.gateway_types = {}     # map gateway names to gateway types
+        self.gateway_users = {}     # map gateway names to gateway users
         self.argfactories = {}      # map gateway types to functions with signature (self, gateway_cert)
         self.exit_handlers = {}     # map gateway types to functions with signature (self, gateway-cert, exit_status)
         self.lock = threading.Lock()
@@ -131,7 +135,7 @@ class AMDState(object):
         """
         Get the extra arguments for a gateway, by type
         """
-        argfactory = self.argfactories.get( gateway_type, None )
+        argfactory = self.argfactories.get( gateway_cert.gateway_type, None )
         if argfactory is None:
             return []
 
@@ -199,7 +203,7 @@ class AMDState(object):
             handler_info.append( (volume_name, username, gateway_name, gateway_type, exit_status) )
 
         # inform exit handler
-        for volume_name, username, gateway_name, gateway_type, exit_status in dead:
+        for volume_name, username, gateway_name, gateway_type, exit_status in handler_info:
             exit_handler = self.exit_handlers.get( gateway_type, None )
             if exit_handler is not None:
                 gateway_cert = object_stub.load_gateway_cert( self.config, gateway_name )
@@ -252,7 +256,7 @@ class AMDState(object):
             if volume_name in self.volume_table.keys():
                 if gateway_name in self.volume_table[volume_name]:
                     self.volume_table[volume_name].remove( gateway_name )
-                    if len(volume_table[volume_name]) == 0:
+                    if len(self.volume_table[volume_name]) == 0:
                         del self.volume_table[volume_name]
 
         if gateway_name in self.gateway_types.keys():
@@ -278,10 +282,10 @@ class AMDState(object):
 
         p = subprocess.Popen( arglist, shell=False, stdin=None, stdout=logfd, stderr=logfd, close_fds=True )
         if p is None:
-            log.error("Failed to start '%s' (%s)" % (gateway_name, p.pid))
+            log.error("Failed to start gateway '%s'" % gateway_name)
             return False
 
-        log.debug("Started '%s' (%s)" % (gateway_name, p.pid) )
+        log.debug("Started gateway '%s' (PID=%s)" % (gateway_name, p.pid) )
     
         self.put_gateway_process( volume_name, username, gateway_name, gateway_type, p )
         return True
@@ -389,18 +393,18 @@ class AMDState(object):
             else:
                 # volume is already present.
                 # find new gateway info
-                for gateway_name in new_volume_info['gateways'].keys():
+                for gateway_name in new_volume_info[new_volume]['gateways'].keys():
                     if gateway_name == "__pkey__":
                         continue 
 
-                    if gateway_name not in cur_volume_table[cur_volume]:
+                    if gateway_name not in cur_volume_table[new_volume]:
                         # new gateway 
                         log.debug("New gateway in existing volume: '%s'" % gateway_name)
                         if volume_name in new_volume_info.keys():
-                            new_volume_diff[volume_name][gateway_name] = new_volume_info[cur_volume][gateway_name]
+                            new_volume_diff[volume_name][gateway_name] = new_volume_info[new_volume][gateway_name]
 
                         else:
-                            new_volume_diff[volume_name] = { gateway_name: new_volume_info[cur_volume][gateway_name] }
+                            new_volume_diff[volume_name] = { gateway_name: new_volume_info[new_volume][gateway_name] }
 
                         # propagate initial private key
                         if "__pkey__" not in new_volume_diff[volume_name].keys():
@@ -616,12 +620,12 @@ def poll_volumes( amd_client_privkey, amd_server_pubkey, amd_client_host, amd_in
     return parse_volumes( amd_client_privkey, amd_server_pubkey, signed_volume_info_text )
 
 
-def gateway_update_key( client, gateway_name, private_key_pem ):
+def gateway_update_key( client, gateway_name, private_key_pem, cert_version ):
     """
     Set a gateway's keypair.
     """
     try:
-        rc = rpcclient.ms_rpc( client, "update_gateway", gateway_name, private_key=private_key_pem )
+        rc = rpcclient.ms_rpc( client, "update_gateway", gateway_name, private_key=private_key_pem, cert_version=cert_version )
         assert rc, "Update failed"
     except Exception, e:
         log.exception(e)
@@ -630,7 +634,7 @@ def gateway_update_key( client, gateway_name, private_key_pem ):
     return True 
 
 
-def gateway_ensure_key_updated( client, gateway_name, private_key_pem ):
+def gateway_ensure_key_updated( client, gateway_name, initial_private_key_pem, cert_version ):
     """
     Ensure that a gateway's private key has been regenerated, and is thus
     different from the initial private key the AMD server gave us.
@@ -644,12 +648,15 @@ def gateway_ensure_key_updated( client, gateway_name, private_key_pem ):
         need_update = True 
 
     else:
-        need_update = (private_key_pem == gateway_pkey.exportKey())
+        # still using initial private key
+        need_update = (initial_private_key_pem.strip() == gateway_pkey.exportKey().strip())
 
     if need_update:
-        # re-generate and update 
+        # make sure we have the latest cert version (it's possible we got a stale cert
+        # from the automount server)
+        # make the new keypair
         pubkey_pem, privkey_pem = crypto.generate_key_pair( object_stub.OBJECT_KEY_SIZE )
-        rc = gateway_update_key( client, gateway_name, privkey_pem )
+        rc = gateway_update_key( client, gateway_name, privkey_pem, cert_version )
         if not rc:
             log.error("Failed to update key for gateway '%s'" % gateway_name )
 
@@ -681,21 +688,38 @@ def user_info_remove( config, user_id ):
     object_stub.remove_user_cert( config, user_cert.email )
 
 
-def gateway_info_install( config, gateway_cert, gateway_privkey_pem ):
+def gateway_info_install( config, gateway_cert, initial_gateway_privkey_pem ):
     """
     Given a gateway's automount server info, put it in place.
+    Return the largest cert version--either the one we got, or the one we cached.
     """
-    privkey = CryptoKey.importKey( gateway_privkey_pem )
-    storage.store_private_key( config, "gateway", gateway_cert.name, privkey, overwrite=True )
+    initial_privkey = CryptoKey.importKey( initial_gateway_privkey_pem )
+    old_privkey = storage.load_private_key( config, "gateway", gateway_cert.name )
+
+    if old_privkey is None:
+        storage.store_private_key( config, "gateway", gateway_cert.name, initial_privkey, overwrite=True )
+
+    version = gateway_cert.version
+    existing_cert = object_stub.load_gateway_cert( config, gateway_cert.name )
+    if existing_cert is not None:
+        version = max( gateway_cert.version, existing_cert.version )
+
+    cached_version_path = conf.object_file_path( config, "gateway", "%s.version" % gateway_cert.name)
+    if os.path.exists(cached_version_path):
+        try:
+            with open(cached_version_path, "r") as f:
+                dat = f.read()
+                ver = int(dat)
+                version = max(ver, version)
+        except:
+            pass
+
+    with open(cached_version_path, "w") as f:
+        f.write(str(version))
+        f.flush()
+        
     object_stub.store_gateway_cert( config, gateway_cert )
-
-
-def gateway_info_remove( config, gateway_name ):
-    """
-    Given a gateway's name, remove its cert and private key
-    """
-    storage.erase_private_key( config, "gateway", gateway_name )
-    object_stub.remove_gateway_cert( config, gateway_name )
+    return version
 
 
 def start_gateways( amd_state, volume_info ):
@@ -745,17 +769,17 @@ def start_gateways( amd_state, volume_info ):
                 continue
 
             # install this gateway 
-            gateway_info_install( amd_state.config, gateway_cert, gateway_initial_pkey )
+            gateway_cert_version = gateway_info_install( amd_state.config, gateway_cert, gateway_initial_pkey )
 
             # ensure the gateway's pkey is different from the AMD server-given one
-            rc = gateway_ensure_key_updated( client, gateway_name, gateway_initial_pkey )
+            rc = gateway_ensure_key_updated( client, gateway_name, gateway_initial_pkey, gateway_cert_version + 1 )
             if not rc:
                 log.error("Failed to set up key for gateway '%s'" % gateway_name )
                 final_rc = False
                 continue 
 
             # start this gateway, if not running
-            if not_amd_state.is_gateway_running( gateway_name ):
+            if not amd_state.is_gateway_running( gateway_name ):
                 rc = amd_state.start_gateway( volume_name, gateway_users[gateway_name], gateway_name, gateway_infos[gateway_name].gateway_type )
                 if not rc:
                     log.error("Failed to start gateway '%s' in '%s'" % (gateway_name, volume_name))
@@ -801,10 +825,12 @@ def reprovision( amd_state ):
     # start up new gateways 
     final_rc = True
     
-    log.debug("Start gateways")
+    log.debug("Start new gateways")
     rc = start_gateways( amd_state, new_volume_info )
     if not rc:
         final_rc = False
+
+    log.debug("Stop old gateways")
 
     # stop dead gateways 
     for old_gateway_name in old_gateways:
@@ -982,11 +1008,13 @@ def gateway_restart( amd_state, gateway_cert, exit_status ):
         # told to exit?
         if -exit_status in [signal.SIGTERM, signal.SIGKILL, signal.SIGINT, signal.SIGQUIT]:
             # do nothing--was told to exit
+            log.debug("Gateway '%s' was signaled to exit (sig=%s)" % (gateway_cert.name, -exit_status))
             return True
 
     else:
         if exit_status == 0:
             # told to exit
+            log.debug("Gateway '%s' exited successfully" % (gateway_cert.name))
             return True
     
     # died unexpectedly.  restart.
@@ -1037,12 +1065,22 @@ def TEST_select_gateway_path( gateway_cert ):
     return None
 
 
+def sigchld_handler( signum, frame ):
+    """
+    SIGCHLD handler--forward to automount state sigchld handler.
+    """
+    global g_amd_state
+    g_amd_state.sigchld_handler()
+
+
 def main( config, run_once=False, gateway_path_func=None ):
     """
     Main loop:
     * poll the volumes every so often and reprovision
     * optionally wait to be woken up by the automount server
     """
+
+    global g_amd_state
 
     poll_interval = config['amd_poll_interval']
     logdir = config['amd_logdir']
@@ -1058,12 +1096,17 @@ def main( config, run_once=False, gateway_path_func=None ):
     amd_state.set_gateway_exit_handler( SYNDICATE_RG, gateway_restart )
     amd_state.set_gateway_exit_handler( SYNDICATE_AG, gateway_restart )
 
+    g_amd_state = amd_state
+
+    signal.signal( signal.SIGCHLD, sigchld_handler )
+
     log.debug("Entering main loop")
     while True:
 
         delay = 1.0
         while True:
             # try to reprovision, with exponential back-off on failure
+            log.debug("Begin reprovision at %s" % time.time())
             rc = reprovision( amd_state )
             if not rc:
                 delay = 2 * delay + (random.random() * delay)
@@ -1074,11 +1117,11 @@ def main( config, run_once=False, gateway_path_func=None ):
                 log.debug("Successfully reprovisioned")
                 break
 
-        try:
-            time.sleep(poll_interval)
-        except:
-            # interrupt 
-            break
+        log.debug("Sleep for %s seconds" % poll_interval)
+        deadline = time.time() + poll_interval
+        while time.time() < deadline:
+            # mask interrupts from SIGCHLD
+            time.sleep(deadline - time.time())
 
         if run_once:
             break
@@ -1126,6 +1169,11 @@ if __name__ == "__main__":
             # for testing purposes: start up and supervise gateways.  do not poll for more info.
             log.warning("Testing method: reprovision")
             main( config, gateway_path_func=TEST_select_gateway_path, run_once=True )
+
+        elif args[0] == 'test':
+            # for testing purposes: start up and supervise gateways.  continuously poll
+            log.warning("Testing")
+            main( config, gateway_path_func=TEST_select_gateway_path )
 
     else:
         main( config ) 
