@@ -309,7 +309,7 @@ class AMDState(object):
         self.lock.release()
         
         # sigchld handler takes care of the rest
-        return
+        return True
 
 
     def start_volume( self, volume_name, usernames, gateway_names, gateway_types ):
@@ -368,11 +368,12 @@ class AMDState(object):
 
         self.lock.acquire()
         cur_volume_table = copy.deepcopy( self.volume_table )
-        cur_gateway_table = copy.deepcopy( self.gateway_table )
         self.lock.release()
 
         new_volume_diff = {}
         old_gateways = []
+
+        log.debug("current volume table:\n%s" % json.dumps(cur_volume_table, indent=4, sort_keys=True))
 
         for new_volume in new_volume_info.keys():
             cur_volume_gateways = cur_volume_table.get( new_volume, None )
@@ -412,14 +413,13 @@ class AMDState(object):
 
 
         for cur_volume in cur_volume_table.keys():
-                
-            assert 'gateways' in new_volume_info[new_volume].keys()
-            assert 'users' in new_volume_info[new_volume].keys()
-
+            
             if cur_volume not in new_volume_info.keys():
                 # volume is dead 
-                for dead_gateway in cur_volume_table[cur_volume]['gateways']:
-                    log.debug("Dead volume, gateway '%s'" % dead_gateway)
+                log.debug("Volume '%s' is to be unmounted" % cur_volume)
+
+                for dead_gateway in cur_volume_table[cur_volume]:
+                    log.debug("Unmounted volume, dead gateway '%s'" % dead_gateway)
 
                 old_gateways += cur_volume_table[cur_volume]
 
