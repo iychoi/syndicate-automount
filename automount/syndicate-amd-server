@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 """
    Copyright 2016 The Trustees of Princeton University
 
@@ -66,6 +66,7 @@ log = conf.log
 
 AMD_REQUEST_FIELDS = ['hostname', 'instance']
 AMD_REQUEST_MAX_LEN = 16384
+AMD_CONFIG_PATH = None
 
 # 'amd-server' section of the config file
 AMD_SERVER_OPTIONS = {
@@ -86,7 +87,13 @@ def helper_run( helper_path, *args ):
         log.error("Not found: %s" % helper_path )
         return None
 
-    helper = subprocess.Popen( [helper_path] + list(args), shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE )
+    helper_env = {
+        "SYNDICATE_AMD_SERVER": sys.argv[0],
+        "SYNDICATE_AMD_DEBUG": "1",
+        "SYNDICATE_AMD_CONFIG": AMD_CONFIG_PATH
+    }
+
+    helper = subprocess.Popen( [helper_path] + list(args), shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=helper_env )
     helper_out, helper_err = helper.communicate()
     helper.wait()
 
@@ -216,7 +223,7 @@ def amd_get_info( config, request, host_info ):
     host_pubkey_pem = host_info['public_key']
 
     # make the provisioning plan for this host
-    ret = provisioning.make_host_provision_plan( config, privkey_pem, host_pubkey_pem, hostname, instance, volumes, gateway_pkey_generator=get_gateway_initial_pkey )
+    ret = provisioning.make_host_provision_plan( config, privkey_pem, host_pubkey_pem, hostname, volumes, gateway_pkey_generator=get_gateway_initial_pkey )
     return ret
 
 
@@ -708,7 +715,6 @@ def provision( config, provision_plan ):
                 {
                     "owner": username,
                     "volume": volume,
-                    "instance": name_prefix,    # <-- e.g. the slice name
                     "type": type,
                     "host": hostname,
                     "port": portnum
@@ -718,8 +724,7 @@ def provision( config, provision_plan ):
                 {
                     "instance": name_prefix,
                     "type": type,
-                    "host": host,
-                    "port": portnum
+                    "host": host
                 } ...
             ]
     }
@@ -842,15 +847,69 @@ def get_config( argv ):
     return syndicate_config 
 
 
+provision_plan_doc = """
+Provision plan format (JSON):
+{
+   "users": {
+      "create": [
+          {
+              "username": the email address of the user to ensure exists
+          }, ...
+       ],
+       "delete": [
+          list of names of users to ensure don't exist
+       ]
+   },
+   "volumes": {
+      "create": [
+         {
+             "name": the name of the volume,
+             "description": a description of the volume,
+             "blocksize": (integer) the size of the volume blocks in bytes,
+             "owner":  the email address of the volume owner,
+             "private":  true|false (whether or not anyone can access the volume),
+             "archive":  true|false (whether or not this volume is a read-only archive)
+         }, ...
+      ],
+      "delete": [
+         list of volume names to ensure don't exist
+      ]
+   },
+   "gateways": {
+      "create": [
+         {
+            "owner": email address of the user who owns this gateway,
+            "volume": name of the volume to which this gateway belongs,
+            "type":  the type of gateway,
+            "host":  the host on which this gateway runs,
+            "port":  (integer) the port on which this gateway listens
+         }, ...
+      ],
+      "delete": [
+         {
+            "owner": the email address of the user who owns this gateway,
+            "type":  the type of gateway,
+            "host":  the host on which this gateway runs
+         }, ...
+      ]
+   }
+}
+"""
+
 def main( argv ):
     """
     Main method:
     """
+    global AMD_CONFIG_PATH
+
     config = get_config( argv )
+    AMD_CONFIG_PATH = config['config_path']
+
     args = config['params']
+    usage = "Usage: %s [server|provision|hostinfo] [args...]" % sys.argv[0]
 
     if len(args) == 0:
-        print >> sys.stderr, "Usage: %s [server|provision|getinfo] [args...]" % sys.argv[0]
+        print >> sys.stderr, usage
         sys.exit(1)
         
     elif args[0] == 'server':
@@ -868,6 +927,10 @@ def main( argv ):
         # provision gateways, using a provision plan
         rc = False
         if len(args) > 1:
+            if args[1] == "help" or args[1] == '-h':
+                print >> sys.stderr, "Usage: %s provision [path to provision plan]\nIf no arguments are given, the provision plan is read from stdin." % sys.argv[0]
+                sys.exit(0)
+
             rc = main_provision( config, provision_plan_path=args[1] )
         else:
             rc = main_provision( config )
@@ -878,6 +941,7 @@ def main( argv ):
             sys.exit(1)
 
     elif args[0] == 'getinfo':
+        # undocumented test method; do not rely upon
         info_text = amd_handle_request( config, config['amd_server_privkey'], sys.stdin )
         if info_text is None:
             log.error("No data for this request")
@@ -887,8 +951,54 @@ def main( argv ):
         print json.dumps(info, indent=4, sort_keys=True)
         sys.exit(0)
 
+    elif args[0] == 'hostinfo':
+        if len(args) < 4:
+            print >> sys.stderr, "Usage: %s hostinfo [provision plan] [hostname] [instance ID] [public key]" % sys.argv[0]
+            print >> sys.stderr, "If public key is not given, it will be read from stdin."
+            sys.exit(1)
+
+        provision_path = args[1]
+        hostname = args[2]
+        instance = args[3]
+        pubkey_pem = None
+
+        if len(args) == 5:
+            pubkey_path = args[4]
+            pubkey = storage.read_key( pubkey_path, public=True )
+            if pubkey is None:
+                print >> sys.stderr, "Failed to read public key at '%s'" % pubkey_path
+                sys.exit(1)
+
+            pubkey_pem = pubkey.exportKey()
+        
+        else:
+            pubkey_pem = stdin.read()
+            
+        with open(provision_path, "r") as f:
+            provision_txt = f.read()
+
+        try:
+            provision_plan = json.loads(provision_txt)
+        except Exception, e:
+            print >> sys.stderr, "Failed to parse provision plan '%s'" % provision_path
+            print >> sys.stderr, provision_plan_doc
+            sys.exit(1)
+
+        request_info = {
+            'hostname': hostname,
+            'instance': instance
+        }
+        
+        host_info = {
+            'public_key': pubkey_pem
+        }
+
+        info = amd_get_info( config, request_info, host_info )
+        print json.dumps(info, indent=4, sort_keys=True)
+        sys.exit(0)
+
     else:
-        print >> sys.stderr, "Usage: %s [server|provision|getinfo] [args...]" % sys.argv[0]
+        print >> sys.stderr, usage
         sys.exit(1)
 
 if __name__ == "__main__":
