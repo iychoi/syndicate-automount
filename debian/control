@@ -1,0 +1,14 @@
+Source: syndicate-automount
+Section: utils
+Priority: optional
+Maintainer: Zack Williams, University of Arizona <zdw@cs.arizona.edu>
+Standards-Version: 3.9.5
+Build-Depends: debhelper (>= 9), pkg-config
+
+Package: syndicate-automount
+Architecture: any
+Depends:  ${shlibs:Depends}, ${misc:Depends}, python, syndicate-core
+Description: Syndicate Automount Service
+ This is the Syndicate automount service. It lets you run and manage a large
+ set of gateways from a single computer.
+
