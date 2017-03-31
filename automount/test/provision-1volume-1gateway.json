@@ -27,7 +27,8 @@
             "volume": "foo.testvolume-001",
             "type": "RG",
             "host": "localhost",
-            "port": 31000
+            "port": 31000,
+            "driver": "syndicate.rg.drivers.disk"
          }
       ],
       "delete": []
