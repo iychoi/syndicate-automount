@@ -540,9 +540,8 @@ def unpack_volume_info( amd_pubkey_pem, client_privkey_pem, volume_info ):
                 log.exception(e)
                 log.error("Failed to parse gateway cert for '%s'" % gateway_name)
                 return None
-                
-            unpacked_gateway_info[gateway_name] = cert_info 
-
+               
+            unpacked_gateway_info[gateway_name] = cert_info
 
         # unpack user info 
         unpacked_user_info = {}
@@ -915,6 +914,7 @@ def get_config( argv ):
     # get the amd server's public key
     server_pubkey = poll_server_pubkey( amd_instance_id, host, port )
     if server_pubkey is None:
+        log.error("Failed to get server pubkey")
         return False
 
     syndicate_config['amd_server_host'] = host
@@ -1131,6 +1131,10 @@ def main( config, run_once=False, gateway_path_func=None ):
 
 if __name__ == "__main__":
     config = get_config( sys.argv )
+    if not config:
+        print >> sys.stderr, "Failed to load config"
+        sys.exit(1)
+
     args = config['params']
 
     if len(args) > 0:
