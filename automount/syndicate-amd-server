@@ -548,6 +548,45 @@ def store_gateway_initial_pkey( config, volume_name, pkey_pem ):
     return True
 
 
+def get_instance_id_from_fq_volume_name(volume_name):
+    if '.' not in volume_name:
+        raise Exception("Invalid volume name: {}".format(volume_name))
+
+    return volume_name.split('.')[0]
+
+
+def get_volume_name_from_fq_volume_name(volume_name):
+    if '.' not in volume_name:
+        raise Exception("Invalid volume name: {}".format(volume_name))
+
+    return volume_name.split('.', 1)[1]
+
+
+def gateway_get_driver_path( driver_name ):
+    """
+    Get the path to the driver on disk, given the package name
+    Return the path on success
+    Return None on error
+    """
+    cmd = "{} -c 'import {}; print {}.__file__'".format(sys.executable, driver_name, driver_name)
+    log.debug("Find path to {} with \"{}\"".format(driver_name, cmd))
+    p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
+    path_buf, err = p.communicate()
+
+    if p.returncode is not None and p.returncode != 0:
+        log.error("Failed to find {}: exit code {}".format(driver_name, p.returncode))
+        return None
+
+    path = path_buf.strip().split("\n")[-1].strip()
+    if os.path.basename(path) not in ['__init__.py', '__init__.pyc']:
+        log.error("Invalid package: no __init__.py found")
+        return None
+
+    pkg_path = os.path.dirname(path)
+    log.debug("Path to {} is {}".format(driver_name, pkg_path))
+    return pkg_path
+
+
 def provision_gateways_add( client, gateway_provision_plan, failed_users=[], failed_volumes=[] ):
     """
     Add a set of gateways.
@@ -570,7 +609,9 @@ def provision_gateways_add( client, gateway_provision_plan, failed_users=[], fai
         # get or generate private keys for these gateways, grouped by volume
         for gateway_info in gateway_provision_plan["create"]:
 
-            gateway_name = provisioning.make_gateway_name( gateway_info['type'], gateway_info['volume'], gateway_info['host'] )
+            instance_id = get_instance_id_from_fq_volume_name(gateway_info['volume'])
+            volume_name = get_volume_name_from_fq_volume_name(gateway_info['volume'])
+            gateway_name = provisioning.make_gateway_name( instance_id, gateway_info['type'], volume_name, gateway_info['host'] )
             volume_name = gateway_info['volume']
 
             if volume_name in failed_volumes:
@@ -606,7 +647,9 @@ def provision_gateways_add( client, gateway_provision_plan, failed_users=[], fai
         # make sure these gateways exist
         for gateway_info in gateway_provision_plan["create"]:
 
-            gateway_name = provisioning.make_gateway_name( gateway_info['type'], gateway_info['volume'], gateway_info['host'] )
+            instance_id = get_instance_id_from_fq_volume_name(gateway_info['volume'])
+            volume_name = get_volume_name_from_fq_volume_name(gateway_info['volume'])
+            gateway_name = provisioning.make_gateway_name( instance_id, gateway_info['type'], volume_name, gateway_info['host'] )
             if gateway_name in failed_gateways:
                 continue 
 
@@ -630,6 +673,15 @@ def provision_gateways_add( client, gateway_provision_plan, failed_users=[], fai
                 rc = False
                 continue 
 
+            driver_path = None
+            if gateway_info.has_key('driver'):
+                driver_path = gateway_get_driver_path(gateway_info['driver'])
+                if driver_path is None:
+                    log.error("Failed to find driver {}".format(gateway_info['driver']))
+                    failed_gateways.append(gateway_name)
+                    rc = False
+                    continue
+
             try:
                 created, updated, gateway = provisioning.ensure_gateway_exists( gateway_owner_client, gateway_info['type'], gateway_info['owner'], gateway_info['volume'],
                                                                                 gateway_name, gateway_info['host'], gateway_info['port'], private_key=gateway_pkeys[gateway_name],
@@ -642,6 +694,15 @@ def provision_gateways_add( client, gateway_provision_plan, failed_users=[], fai
                 rc = False
                 failed_gateways.append(gateway_name)
                 continue
+
+            if driver_path:
+                try:
+                    rc = rpc.ms_rpc( gateway_owner_client, "update_gateway", gateway_name, driver=driver_path )
+                except:
+                    log.exception(e)
+                    rc = False
+                    failed_gateways.append(gateway_name)
+                    continue
 
     return rc, failed_gateways
 
@@ -660,7 +721,9 @@ def provision_gateways_remove( client, gateway_provision_plan ):
         # delete gateways 
         for gateway_info in gateway_provision_plan["delete"]:
 
-            gateway_name = provisioning.make_gateway_name( gateway_info['type'], gateway_info['volume'], gateway_info['host'] )
+            instance_id = get_instance_id_from_fq_volume_name(gateway_info['volume'])
+            volume_name = get_volume_name_from_fq_volume_name(gateway_info['volume'])
+            gateway_name = provisioning.make_gateway_name( instance_id, gateway_info['type'], volume_name, gateway_info['host'] )
             log.info("Delete gateway '%s'" % gateway_name )
 
             try:
@@ -717,7 +780,8 @@ def provision( config, provision_plan ):
                     "volume": volume,
                     "type": type,
                     "host": hostname,
-                    "port": portnum
+                    "port": portnum,
+                    "driver": package name (e.g. syndicate.rg.drivers.disk)
                 }, ...
             ]
             "delete": [
