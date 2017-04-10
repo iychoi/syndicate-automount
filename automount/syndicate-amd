@@ -1057,13 +1057,13 @@ def TEST_select_gateway_path( gateway_cert ):
     """
 
     if gateway_cert.gateway_type == SYNDICATE_AG:
-        return "/tmp/mock-syndicate-ag"
+        return "/usr/bin/syndicate-ag"
 
     elif gateway_cert.gateway_type == SYNDICATE_RG:
-        return "/tmp/mock-syndicate-rg"
+        return "/usr/bin/syndicate-rg"
 
     elif gateway_cert.gateway_type == SYNDICATE_UG:
-        return "/tmp/mock-syndicate-ug"
+        return "/usr/bin/syndicate-ug"
 
     return None
 
