@@ -21,6 +21,7 @@
 import os
 import sys
 import json
+import socket
 
 
 def TEST_get_all_hosts():
@@ -28,7 +29,7 @@ def TEST_get_all_hosts():
     Fetch and return a list of hosts.
     Test implementation. Do not use in production.
     """
-    return ["t510", "localhost"]
+    return [socket.gethostname(), "localhost"]
 
 
 def opencloud_get_all_hosts():
