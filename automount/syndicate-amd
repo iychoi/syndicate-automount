@@ -151,8 +151,11 @@ class AMDState(object):
         gateway_cert = object_stub.load_gateway_cert( self.config, gateway_name )
         assert gateway_cert is not None, "No cert on file for gateway '%s'" % gateway_name
 
-        exec_path = self.get_gateway_exec_path( gateway_cert )
-        arglist = [exec_path, "-f", "-v", volume_name, "-g", gateway_name, "-u", username]
+        exec_path = self.get_gateway_exec_path( gateway_cert ) 
+        if 'config' in self.config: #insert syndicate.conf if arg was provided
+            arglist = [exec_path, "-f", "-c", self.config['config'], "-v", volume_name, "-g", gateway_name, "-u", username]
+        else:
+            arglist = [exec_path, "-f", "-v", volume_name, "-g", gateway_name, "-u", username]
         if self.debug:
             arglist += ["-d2"]
 
