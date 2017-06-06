@@ -41,6 +41,7 @@ Automount response structure (signed by automount server):
 import os
 import sys
 import threading
+import traceback
 import tempfile
 import time
 import subprocess
@@ -402,6 +403,9 @@ def str_to_bool( s ):
     """
     Convert "true" to True; "false" to False
     """
+    if s == True or s == False:
+        return s
+
     if type(s) not in [str, unicode]:
         raise ValueError("'%s' is not a string" % s)
 
@@ -786,7 +790,7 @@ def provision( config, provision_plan ):
             ]
             "delete": [
                 {
-                    "instance": name_prefix,
+                    "volume": volume
                     "type": type,
                     "host": host
                 } ...
@@ -886,8 +890,8 @@ def get_config( argv ):
     try:
         assert amd_pkey_path is not None, "Missing private key"
         amd_portnum = int(amd_portnum)
-    except AssertionError, e:
-        log.exception(e)
+    except Exception as e:
+        traceback.print_exc()
         conf.print_parser_help( argv[0], "Automount server help", AMD_SERVER_OPTIONS )
         sys.exit(1)
     
@@ -896,9 +900,9 @@ def get_config( argv ):
     
     try:
         assert pkey is not None, "Unable to load private key '%s'" % amd_pkey_path
-    except AssertionError, e:
-        log.exception(e)
-        conf.print_parser_help( argv[0], "Automount client help", AMD_SERVER_OPTIONS )
+    except Exception, e:
+        traceback.print_exc()
+        conf.print_parser_help( argv[0], "Automount server help", AMD_SERVER_OPTIONS )
         sys.exit(1)
     
     pkey_pem = pkey.exportKey()
@@ -973,6 +977,7 @@ def main( argv ):
     usage = "Usage: %s [server|provision|hostinfo] [args...]" % sys.argv[0]
 
     if len(args) == 0:
+        print >> sys.stderr, "No args given"
         print >> sys.stderr, usage
         sys.exit(1)
         
